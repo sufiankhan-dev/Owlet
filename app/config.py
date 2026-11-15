@@ -144,8 +144,6 @@ class Settings:
             self.config_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
-        for course in ("Database Systems", "Software Engineering", "Software Quality Engineering"):
-            (self.workspace_dir / course).mkdir(parents=True, exist_ok=True)
 
 
 def load_settings() -> Settings:
