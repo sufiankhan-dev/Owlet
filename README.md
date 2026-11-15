@@ -1,210 +1,211 @@
-# Owlet — a local Moodle study assistant
+# Owlet
 
-Owlet is a Windows desktop-style study assistant that drives a **visible Chrome
-window** through your Moodle courses with Playwright, reads assignments and
-attachments, explains the work, and generates study files. The language model is
-**`qwen3:8b` running locally in Ollama**. There is no cloud AI, no remote server,
-and no Moodle password storage.
+**A private AI study assistant for Moodle that runs entirely on your own computer.**
 
-> Everything binds to `127.0.0.1`. The app never submits assignments, uploads
-> files, changes grades/profile/enrolment, or deletes Moodle content. Those
-> actions stay with you.
+Owlet logs into Moodle *with you* (in a normal Chrome window you can watch),
+collects your courses, assignments, deadlines, and the teacher's files, and puts
+everything into neat folders. Then you can chat with a local AI to explain an
+assignment, plan your work, or draft a first version of the deliverables.
+
+- **Private.** The AI runs on your machine through [Ollama](https://ollama.com/).
+  No cloud AI, no API keys, no accounts, no data sent anywhere.
+- **Transparent.** Chrome stays visible, so you see every page Owlet opens.
+- **Read-only.** Owlet never submits, uploads, deletes, or changes anything on
+  Moodle. You stay in control.
+- **Never sees your password.** You log in to Moodle yourself, in Chrome.
+
+> **Use it responsibly.** Owlet is a reading and drafting aid. Follow your
+> institution's academic-integrity rules and check whether AI help is allowed in
+> your course. Always review anything it writes.
 
 ---
 
-## Quick start
+## What it does
 
-### Requirements
+| | |
+| --- | --- |
+| **Syncs your Moodle** | After you log in, it reads every course and assignment: status, due date, instructions, and the teacher's attached files. |
+| **Shows what's urgent** | Assignments get a badge: red for **overdue** or due within 24 hours, amber for due within 48 hours. |
+| **Organises your files** | One folder per course, one per assignment, with the instructions and attachments already inside. |
+| **Answers questions** | Ask "What should I do first?", "Explain this assignment", or "Summarise this course". |
+| **Drafts assignments** | One click writes a first draft (Word, PDF, or code) plus a checklist of requirements. You review it and submit it yourself. |
+| **Reads documents** | PDF, Word, PowerPoint (slides and notes), text, and code files. |
 
-- Windows 10/11 (verified on Windows 11 build 26200)
-- Python 3.11+ (verified on 3.14.3)
-- [Ollama](https://ollama.com/) running locally (verified on 0.40.15)
-- Google Chrome installed (verified on 156)
-- ~8 GB free RAM for `qwen3:8b` (31.7 GB available on the test machine)
+### What it will never do
 
-### Install
+- Submit an assignment or upload anything to Moodle
+- Change grades, your profile, enrolment, or course content
+- Bypass login, MFA, CAPTCHA, or any access control
+- Run the code it generates, or run shell commands
+- Talk to any online AI service
+- Accept connections from other computers
+
+---
+
+## Getting started
+
+### What you need
+
+- **Windows 10 or 11**
+- **Python 3.11 or newer**: [python.org/downloads](https://www.python.org/downloads/)
+- **Google Chrome** (Microsoft Edge works too)
+- **Ollama**: [ollama.com](https://ollama.com/)
+- About **8 GB of free RAM** for the AI model (a GPU helps but isn't required)
+
+### Install (one time)
+
+Open PowerShell and run:
 
 ```powershell
-cd C:\Users\DELL\Desktop\Agent\Owlet
+# 1. Download Owlet
+git clone https://github.com/sufiankhan-dev/Owlet.git
+cd Owlet
 
-# 1. Python dependencies
+# 2. Install the Python packages
 python -m pip install -r requirements.txt
 
-# 2. Local model (one time, ~5.2 GB)
+# 3. Download the AI model (about 5 GB)
 ollama pull qwen3:8b
-
-# 3. Optional configuration
-Copy-Item .env.example .env
 ```
 
-The defaults work without editing `.env`. Keep `APP_HOST=127.0.0.1` and
-`BROWSER_HEADLESS=false`.
-
-### Run
+### Start Owlet
 
 ```powershell
 python main.py
 ```
 
-This starts the API **and** the dashboard on **http://127.0.0.1:8765**. There is
-no second process and no Node build step: the dashboard is three static files
-(`app/ui/index.html`, `app/ui/styles.css`, `app/ui/app.js`) served by FastAPI
-itself, so `connect-src 'self'` and the CSRF header keep working unchanged.
+Then open **http://127.0.0.1:8765** in your browser.
 
-The dashboard's look (oklch neutrals, `0.65rem` radius, card/button/badge
-treatment) follows the shadcn/ui token set, so it reads like the previous
-Next.js dashboard while shaving a whole toolchain off the install.
+### First use
 
-1. In **Moodle connection**, the URL is already filled with
-   `https://lms.dsu.edu.pk/` (change it if you use another Moodle).
-2. If your campus puts Moodle behind an HTTP Basic auth popup, open
-   **Network login (only if Chrome asks)** in that panel and enter the network
-   username and password. They go straight to Chrome for that one site, stay in
-   memory, and are cleared when you disconnect. Without them, Chrome cannot open
-   the page at all and the connect call says so explicitly.
-3. Click **Connect**. A visible Chrome window opens with the persistent profile in
-   `browser/profile`.
-4. Log in manually (including SSO/MFA). Owlet never sees, types, or stores your
-   Moodle account password.
-5. That's it. The dashboard polls Chrome every few seconds (or click **Check
-   login**), and the first check that sees you logged in starts a **sync** on its
-   own. It fetches everything: every course, each assignment's status and due
-   date, each assignment's instructions, and the files the teacher attached. It
-   all lands in one folder per course under `workspace/`.
-6. Ask in the chat. The suggestion chips under the welcome text are built from
-   your synced data (“What should I do first?”, “Explain *your most urgent
-   assignment*”, “Plan …”, “Summarise *a course*”), or type your own, for example:
-   - “Download the assignment PDF and summarize the requirements”
-   - “Create a Word solution, a PDF summary, and a Python file”
+1. In **Moodle connection**, enter your school's Moodle address
+   (for example `https://moodle.yourschool.edu/`).
+2. Click **Connect**. A Chrome window opens.
+3. **Log in to Moodle in that Chrome window**, the same way you normally do.
+4. Wait a moment. Owlet notices you're logged in and starts syncing your courses
+   and assignments automatically.
+5. Start chatting, or press **Draft** next to any assignment.
 
-The dashboard shows saved courses, pending assignments (submitted and graded work
-is folded under a “submitted or no status” row), the agent's activity, your
-course folders, and any action that needs your approval. Every card — Moodle
-connection, Courses, Pending assignments, Files, Activity — collapses from its
-title; the choice is remembered in this browser. Activity starts collapsed, and
-the connection card folds itself once you are logged in (until you open or close
-it yourself).
+Chrome remembers your login, so next time you usually won't need to log in again.
 
-### Assignment sync
-
-The sync reads `mod/assign/index.php` for each of your courses through Chrome's
-own session (same cookies, same network auth) and stores what Moodle reports:
-
-- **Submission status** — `Not submitted`, `Draft`, `Submitted`,
-  `Submitted for grading`, `Graded`, `Reopened`, or `No submission required`
-  (Moodle's own “No submission” counts as not submitted). A blank cell is
-  recorded as *status unknown* rather than guessed as pending; a phrase the app
-  does not recognise (another theme or language pack) is shown verbatim.
-- **Due date** — the exact instant comes from Moodle's calendar, the same
-  deadline list the Timeline block shows (the read-only web service
-  `core_calendar_get_action_events_by_timesort`, called from inside the logged-in
-  page so the session key never leaves Chrome). A `<time datetime>` or
-  `data-timestamp` on the index page is used too. Display text like “Sunday, 15
-  November 2026, 11:59 PM” is shown but never parsed, so the badge is never hours
-  off. If the calendar service is unavailable, the sync still stores status and
-  due text and says “due-date alerts limited”.
-- **Alert badge** — computed on the server: red **overdue** once the due instant
-  has passed, red **urgent** within 24 h, amber **soon** within 48 h. Roles are
-  sorted so overdue and urgent work floats to the top.
-- **Ignored courses** — courses listed in `IGNORED_COURSES`
-  (`browser/moodle.py`, as host + Moodle course id) are skipped everywhere: not
-  listed, synced, or fetched, and any rows already stored for them (the course
-  and its assignments) are removed on the next course read. Currently:
-  Programming Fundamentals Lab (BS-SE-1B), `lms.dsu.edu.pk` id 6870.
-
-- **Course folders and files.** For each course it creates
-  `workspace/<course>/`, named exactly like the Courses list. For each assignment
-  it reads the assignment page in the background and saves
-  `instructions/assignment.md`, `instructions/metadata.json` and
-  `extracted/page.txt`. It then downloads the teacher's attachments from the
-  assignment description into `attachments/`. Your own submitted files (the
-  submission table) are never fetched. The download size limit
-  (`MAX_DOWNLOAD_MB`) applies.
-- **Attachment text.** Each teacher file (`.pptx`, `.docx`, `.pdf`, or a text/code
-  file) is read into `extracted/<filename>.txt`, and the same text is added to
-  `instructions/assignment.md` under *Attachment content*, above the raw page
-  text. That way the instructions show what the slides or brief actually ask, not
-  just the file name. PowerPoint is read straight from the `.pptx` zip with the
-  standard library (slides in order, plus speaker notes). Each file is added once,
-  marked so it is never duplicated, and folders saved by an older version get
-  their attachment text on the next sync. Legacy `.ppt`/`.doc` and scanned PDFs
-  with no text layer are listed in the sync notes instead.
-  `extracted/page.txt` stays the Moodle page text only.
-
-Pages are read with in-page `fetch` through Chrome's own session, so the visible
-tab is never navigated. Files are only ever **created**: an existing file is never
-rewritten, so a repeat sync downloads nothing it already has. The one exception is
-`assignment.md`, which gets an attachment's text added once, in its marked section. Assignments that are
-still pending are re-checked on each sync for files a teacher added later.
-
-Press **Sync** in the Moodle connection panel to re-read everything at any time;
-the hint under the buttons shows progress (the panel header says “syncing…”
-while it runs). Courses that could not be read, and files that were skipped, are
-listed in the sync summary. While a sync runs, chat messages and `/reset` wait
-for it to finish, because both would disturb the same Chrome tab. Each sync
-overwrites the stored status, so a resubmitted assignment stops looking pending.
-There is no background timer: sync runs on login and when you ask.
-
-### Assignment drafts
-
-Every assignment row has a **Draft** button. It opens a dialog with the draft's
-files and their review state:
-
-1. **Draft with AI** starts an ordinary agent run in *draft mode*, shown in the
-   chat as `Draft: <assignment>`. The assignment is pre-opened, so the model reads
-   the saved `instructions/` and `attachments/` (or opens the Moodle page if
-   nothing was synced) and writes each deliverable into that assignment's folder:
-   - written work → `documents/*.docx`, or `pdfs/*.pdf` if the brief asks for PDF
-   - programming work → `code/*` (never run)
-   - online-text assignments → `code/online_text.md`, the exact text to paste
-   - quizzes, forums, or anything that isn't a file → `code/notes.md` saying what to do
-2. When the run ends, the model's final checklist (deliverables, each requirement
-   mapped to a file or MISSING, assumptions) is saved as `explanations/REVIEW.md`.
-3. **Mark reviewed** records the SHA-256 of every draft file in
-   `<assignment>/review.json`. Editing, adding, or deleting a draft file afterwards
-   shows the draft as **Changed since review** until you review it again.
-
-Draft files are everything under `code/`, `documents/`, `pdfs/` and
-`submission/`; teacher files and the app's notes are never counted. Overwrites
-still go through the approval dialog. **Nothing is submitted:** upload the
-reviewed files to Moodle yourself. The drafts come from a local 8B model, so treat
-them as a starting point, check your course's policy on AI-assisted work, and
-expect to fix things.
-
-Routes: `GET /api/assignments/{id}/draft` (files + status),
-`POST /api/assignments/{id}/draft` (start), `POST /api/assignments/{id}/review`
-(record hashes). The two POSTs need `X-Owlet: 1` like every mutation.
+> **Does your campus show a username/password popup *before* the Moodle page
+> even loads?** That's network login (HTTP Basic auth), not Moodle. Open
+> **Network login** in the connection panel and enter it there. It is kept in
+> memory only and forgotten when you disconnect.
 
 ---
 
-## What it can do
+## How drafting works
 
-| Area | Capability |
+1. Press **Draft** on an assignment, then **Draft with AI**.
+2. Owlet reads the instructions and the teacher's files, then writes the
+   deliverables into that assignment's folder:
+   - essays and reports → `documents/` (Word) or `pdfs/`
+   - programming work → `code/` (never run)
+   - online-text answers → `code/online_text.md`
+3. It also writes `explanations/REVIEW.md`: every requirement and the file that
+   covers it, or **MISSING**.
+4. When you've checked the files, press **Mark reviewed**. If anything changes
+   afterwards, Owlet shows **Changed since review**.
+
+The drafts come from a small local model. Treat them as a starting point, expect
+to fix things, and **upload the final files to Moodle yourself.**
+
+---
+
+## Where your files go
+
+Everything stays on your computer, inside the Owlet folder:
+
+```
+workspace/
+└── Database Systems/                 ← one folder per course
+    └── Normalization Exercise/       ← one folder per assignment
+        ├── instructions/assignment.md   the assignment text
+        ├── attachments/                 files from your teacher
+        ├── extracted/                   text pulled from those files
+        ├── explanations/REVIEW.md       the draft checklist
+        ├── documents/  pdfs/  code/     drafts and generated files
+        └── submission/
+```
+
+Owlet never silently overwrites a file. If it needs to replace one, it asks you
+first, and saying no keeps the original.
+
+**Start fresh:** type `/reset` in the chat. This clears synced data and
+everything in `workspace/` and `generated/`, but keeps your Moodle address and
+Chrome login.
+
+---
+
+## Common problems
+
+| Problem | Fix |
 | --- | --- |
-| Moodle reading | Courses, course pages, assignments, due text, submission status, visible page text and links |
-| Automatic sync | On login (and on demand) reads every course and assignment, stores submission status, due date, and a due-soon/overdue badge, and saves instructions plus teacher attachments into one folder per course — no model involved |
-| Attachments | Download files linked on assignment pages into the assignment workspace |
-| Documents | Read PDFs (PyMuPDF), DOCX, PPTX (slides + notes), TXT/MD/CSV/JSON/YAML/code |
-| Study help | Explain assignments, break requirements into tasks, work through problems step by step |
-| File generation | Word `.docx`, PDF (Chrome print engine), and safe code/text files |
-| Assignment drafts | One click drafts every deliverable (Word/PDF/code/online text) into the assignment folder, writes a requirement checklist, and tracks your review with file hashes. You submit yourself |
-| Workspace | One folder per synced course, one per assignment, with `instructions/`, `attachments/`, `extracted/`, `explanations/`, `code/`, `documents/`, `pdfs/`, `submission/`. Course names given by the model or a breadcrumb (“database systems”, “CS301”) resolve to the synced course, so a course never gets a second folder |
-| UI | Single-page dashboard served by FastAPI: chat with streaming, tool traces, and suggestions built from your data; collapsible cards; browser status; approvals; course-folder tree with downloads; activity log; light/dark theme |
+| Ollama shows **offline** | Start the Ollama app (or run `ollama serve`), then check `ollama list`. |
+| The model is missing | Run `ollama pull qwen3:8b`. |
+| The first answer is very slow | Normal on a CPU: the model is loading. Later answers are faster. |
+| Login isn't detected | Finish logging in, open your Moodle dashboard in Chrome, then click **Check login**. |
+| "Profile already in use" | Close the other Chrome window Owlet opened, or the other copy of Owlet. |
+| Chrome not found | Install Chrome, or set `BROWSER_CHANNEL=msedge` in `.env`. |
+| "Address already in use" | Another program uses port 8765. Change `APP_PORT` in `.env`. |
+| Courses or assignments look wrong | Your school's Moodle theme may be unusual. Ask Owlet to read the visible page, or open it yourself. |
 
-### What it deliberately cannot do
-
-- Submit an assignment or upload a file to Moodle
-- Change grades, profile, password, enrolment, or course settings
-- Delete or edit Moodle content
-- Bypass login, SSO, MFA, CAPTCHA, or access controls
-- Execute generated code
-- Run shell commands
-- Talk to any AI service other than local Ollama
-- Accept connections from outside `127.0.0.1`
+**About speed:** on a CPU, `qwen3:8b` writes around 5 words per second, and the
+first reply after starting can take 1–2 minutes. With a GPU it's much faster.
+Asking for one step at a time helps.
 
 ---
 
-## Architecture
+## Known limitations
+
+- Moodle sites look different. Owlet handles common Moodle 4.x pages and falls
+  back to plain page text when a page is unusual.
+- Scanned PDFs (images with no text) can't be read. There's no OCR.
+- Old `.doc` and `.ppt` files aren't read; `.docx` and `.pptx` are.
+- The AI makes mistakes. Always check its work against the real assignment.
+- Built for one person on one computer, not as a shared web server.
+
+---
+
+## For developers
+
+<details>
+<summary><b>Configuration (<code>.env</code>)</b></summary>
+
+Everything works without a `.env` file. To change settings, copy
+`.env.example` to `.env`.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `APP_HOST` | `127.0.0.1` | Must be loopback; anything else is refused |
+| `APP_PORT` | `8765` | One process serves the API and the dashboard |
+| `OLLAMA_HOST` | `http://localhost:11434` | Must be local |
+| `OLLAMA_MODEL` | `qwen3:8b` | Other local models work; the app is tuned for qwen3 |
+| `OLLAMA_NUM_CTX` | `16384` | Context window |
+| `OLLAMA_TEMPERATURE` | `0.2` | Lower is more predictable |
+| `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the model loaded between turns |
+| `OLLAMA_THINK` | `false` | Thinking mode roughly doubles CPU latency |
+| `BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` |
+| `BROWSER_HEADLESS` | `false` | Must stay `false` for manual login and oversight |
+| `BROWSER_TIMEOUT_MS` | `30000` | Page navigation timeout |
+| `MOODLE_URL` | `https://lms.dsu.edu.pk/` | Default Moodle; change it here or in the dashboard |
+| `MAX_DOWNLOAD_MB` | `50` | Attachment size cap |
+| `MAX_PAGE_CHARS` | `14000` | Page text sent to the model |
+| `MAX_TOOL_RESULT_CHARS` | `8000` | Tool result cap |
+| `APPROVAL_TIMEOUT_S` | `300` | No answer = denied |
+| `MAX_AGENT_ITERATIONS` | `12` | Tool rounds per chat turn |
+| `SYNC_ON_CONNECT` | `true` | Sync automatically once login is detected |
+| `DUE_SOON_HOURS` | `48` | Amber badge threshold |
+| `DUE_URGENT_HOURS` | `24` | Red badge threshold; must not exceed `DUE_SOON_HOURS` |
+
+Courses listed in `IGNORED_COURSES` (`browser/moodle.py`, by host and course id)
+are skipped everywhere.
+
+</details>
+
+<details>
+<summary><b>How it works</b></summary>
 
 ```
 Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
@@ -215,330 +216,143 @@ Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
    FastAPI + SSE  <---- events/approvals ----  Agent loop (validated tool calls)
         |                                                  |
         v                                                  v
-   Dashboard (single page, 127.0.0.1:8765)       Ollama qwen3:8b (localhost)
+   Dashboard (127.0.0.1:8765)                    Ollama qwen3:8b (localhost)
         |
         +--> SQLite (courses, assignments, conversations, activity, approvals)
-        +--> workspace/ (course material, explanations, generated files)
+        +--> workspace/ (course material, generated files)
 ```
 
-The dashboard's assignment list is filled by `app/sync.py`, which `AppState`
-runs directly (after login, or from the **Sync** button). It is not a model tool,
-so the tool set below is unchanged and the model cannot start a scrape.
+- **Stack:** Python, FastAPI, Playwright, Ollama, SQLite. The dashboard is plain
+  HTML/CSS/JS in `app/ui/`, served by FastAPI. No Node, no build step.
+- **Sync** (`app/sync.py`) is not an AI tool, so the model can't start a scrape.
+  It reads `mod/assign/index.php` per course and Moodle's calendar web service
+  for exact due times, all through Chrome's own session using in-page `fetch`.
+  The visible tab is never navigated. Files are only ever created, so a repeat
+  sync downloads nothing it already has. Your own submitted files are never
+  fetched.
+- **A chat turn** is a bounded loop: the model proposes tool calls, they are
+  validated with Pydantic, run against the browser or workspace, and the results
+  go back to the model. Overwrites pause for your approval. Answers stream over
+  Server-Sent Events and are saved in SQLite. **Stop** works between every step.
 
-A chat turn is a bounded tool-calling loop:
+</details>
 
-1. The system prompt and the last messages go to `qwen3:8b`.
-2. Tool calls are validated with Pydantic and classified as read-only or not.
-3. Tools run against the visible browser or the local workspace.
-4. Tool errors are returned to the model as data, so it can recover or explain.
-5. Consequential overwrites pause for an approval in the dashboard.
-6. The answer streams back over Server-Sent Events and is saved in SQLite.
+<details>
+<summary><b>The 14 AI tools</b></summary>
 
-The loop stops after `MAX_AGENT_ITERATIONS` rounds (12 by default) and supports
-**Stop** between every step, with a forced cancel after 10 seconds.
+None of them can write to Moodle.
 
----
+| Tool | Purpose |
+| --- | --- |
+| `get_current_page` | Current URL, title, login state |
+| `get_page_content` | Visible text, headings, links, activities |
+| `navigate_to_url` | Open an allowed read-only Moodle page |
+| `list_courses` | Course overview |
+| `open_course` | Open a course and read its activities |
+| `list_assignments` | Pending assignments with due/status text |
+| `open_assignment` | Read details and save them to the workspace |
+| `download_attachment` | Save a visible file and extract its text |
+| `read_pdf` | Extract PDF text with page limits |
+| `read_document` | Read DOCX/PPTX/text/code from the workspace |
+| `create_word_document` | Create a `.docx` in `documents/` |
+| `create_pdf` | Render a PDF with headless Chrome |
+| `create_code_file` | Write a code/text file (never run) |
+| `save_assignment_workspace` | Save or refresh instructions and page text |
 
-## Tool set
+Navigation is limited to the Moodle host and blocks logout, admin, enrolment,
+grading, profile editing, and submission paths.
 
-Only these 14 implemented tools are exposed to the model:
+</details>
 
-| Tool | Purpose | Moodle writes? |
-| --- | --- | --- |
-| `get_current_page` | Current URL, title, login/connection state | No |
-| `get_page_content` | Visible text, headings, links, activities | No |
-| `navigate_to_url` | Open an allowed read-only Moodle page | No |
-| `list_courses` | Course overview from the logged-in session | No |
-| `open_course` | Open a course and read its activity list | No |
-| `list_assignments` | Pending assignments with raw due/status text | No |
-| `open_assignment` | Read details and save the local workspace | No |
-| `download_attachment` | Fetch a file the user can already see and save its text in `extracted/` | No |
-| `read_pdf` | Extract PDF text with page limits | No |
-| `read_document` | Read DOCX/PPTX/text/code from the workspace | No |
-| `create_word_document` | Create `.docx` in `documents/` | No |
-| `create_pdf` | Render a PDF with headless Chrome | No |
-| `create_code_file` | Write an allowed code/text file; never runs it | No |
-| `save_assignment_workspace` | Save/refresh instructions, metadata, page text | No |
+<details>
+<summary><b>Security model</b></summary>
 
-Navigation is limited to the Moodle host and blocks paths such as logout, admin,
-enrolment, grade editing, profile editing, and assignment upload/submission.
-File writes are jailed to `workspace/` and `generated/`.
+- **Loopback only.** `APP_HOST` is validated at startup; Host and Origin headers
+  are checked on every request.
+- **CSRF guard.** Every POST/PUT/PATCH/DELETE needs the header `X-Owlet: 1`.
+- **No Moodle password handling.** Login happens in Chrome; the app never sees it.
+- **Network login is transient.** The optional HTTP Basic auth pair goes straight
+  to Playwright, lives in memory, is cleared on disconnect, and is never logged
+  or stored.
+- **Read-only Moodle.** Dangerous paths are blocked even if the model asks.
+- **Untrusted content.** Page and document text is treated as data, never as
+  instructions, so "ignore your rules" text in a PDF does nothing.
+- **Approval gate.** Overwrites wait for a click. Timeout or Stop = denied.
+- **Path jail.** All writes stay under `workspace/` or `generated/`; traversal,
+  absolute paths, and symlinks are rejected.
+- **No execution.** Generated code is never run. No shell.
+- **Strict CSP and redaction.** `script-src 'self'`, no framing; cookies,
+  tokens, and URL query strings are stripped from logs and the UI.
 
----
+Do not expose port 8765 through a tunnel, reverse proxy, or firewall rule.
 
-## Configuration
+</details>
 
-Copy `.env.example` to `.env`. Useful values:
-
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `APP_HOST` | `127.0.0.1` | Validated: loopback only |
-| `APP_PORT` | `8765` | API and dashboard port — one process serves both |
-| `OLLAMA_HOST` | `http://localhost:11434` | Must be local |
-| `OLLAMA_MODEL` | `qwen3:8b` | Any installed local model works, but the app is tuned for qwen3 |
-| `OLLAMA_NUM_CTX` | `16384` | Context window |
-| `OLLAMA_TEMPERATURE` | `0.2` | Lower is more predictable |
-| `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the model warm between turns |
-| `OLLAMA_THINK` | `false` | Thinking mode roughly doubles CPU latency |
-| `BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` |
-| `BROWSER_HEADLESS` | `false` | Must stay false for manual login/oversight |
-| `BROWSER_TIMEOUT_MS` | `30000` | Page navigation timeout |
-| `MOODLE_URL` | `https://lms.dsu.edu.pk/` | Default LMS; change it here or in the dashboard |
-| `MAX_DOWNLOAD_MB` | `50` | Attachment size cap |
-| `MAX_PAGE_CHARS` | `14000` | Page text sent to the model |
-| `MAX_TOOL_RESULT_CHARS` | `8000` | Tool result cap |
-| `APPROVAL_TIMEOUT_S` | `300` | A timeout denies the action |
-| `MAX_AGENT_ITERATIONS` | `12` | Tool-round safety bound |
-| `SYNC_ON_CONNECT` | `true` | Read courses/status/due dates automatically once login is detected |
-| `DUE_SOON_HOURS` | `48` | Amber badge threshold |
-| `DUE_URGENT_HOURS` | `24` | Red badge threshold; must not exceed `DUE_SOON_HOURS` |
-
-`python-docx` files, PDFs, and browser output stay on this machine. No API keys
-are required anywhere.
-
----
-
-## Workspace layout
+<details>
+<summary><b>Project layout</b></summary>
 
 ```
 Owlet/
-├── main.py                 # uvicorn entry point
-├── app/
-│   ├── api.py              # FastAPI routes, SSE, CSRF/host guards
-│   ├── state.py            # app state, approvals, run lifecycle
-│   ├── drafts.py           # assignment draft files, review hashes, REVIEW.md
-│   ├── config.py           # validated settings
-│   ├── security.py         # URL policy, path jail, sanitization
-│   ├── events.py           # in-process pub/sub
-│   └── ui/                 # dashboard: index.html, styles.css, app.js
-├── agent/
-│   ├── llm.py              # local Ollama client
-│   ├── loop.py             # bounded tool-calling loop
-│   └── prompts.py          # untrusted-content rules
-├── browser/
-│   ├── session.py          # visible persistent Chrome
-│   └── moodle.py           # DOM snapshot + parsers
-├── tools/                  # the 14 tools and workspace helpers
-├── database/               # SQLite repository
-├── workspace/              # your course material and study files
-├── generated/              # files created with no course or assignment open
-├── logs/                   # rotating local logs
-├── config/                 # saved Moodle URL (not a password)
-├── browser/profile/        # persistent Chrome profile (gitignored)
-└── tests/                  # unit, API, browser, and end-to-end tests
+├── main.py              # entry point → http://127.0.0.1:8765
+├── app/                 # FastAPI routes, state, sync, drafts, security, ui/
+├── agent/               # Ollama client, tool-calling loop, prompts
+├── browser/             # visible Chrome session, Moodle parsers
+├── tools/               # the 14 tools and workspace helpers
+├── database/            # SQLite repository
+├── tests/               # unit, API, browser, and end-to-end tests
+├── workspace/           # your course folders (gitignored)
+└── generated/           # files made with no course open (gitignored)
 ```
 
-An assignment workspace looks like:
+Local data: `database/owlet.db`, `config/app_state.json` (Moodle URL only),
+`browser/profile/` (Chrome login), `workspace/`, `generated/`, `logs/`.
+Stop the app and delete these to wipe everything.
 
-```
-workspace/Database Systems/Normalization Exercise/
-├── instructions/assignment.md
-├── instructions/metadata.json
-├── attachments/instructions.pdf
-├── extracted/page.txt
-├── extracted/instructions.pdf.txt # attachment text (also in assignment.md)
-├── explanations/REVIEW.md      # draft checklist (after "Draft with AI")
-├── code/normalize.py
-├── documents/solution.docx
-├── pdfs/summary.pdf
-├── submission/
-└── review.json                 # hashes recorded by "Mark reviewed"
-```
+API routes for drafts: `GET /api/assignments/{id}/draft`,
+`POST /api/assignments/{id}/draft`, `POST /api/assignments/{id}/review`.
+`POST /api/reset` does the same as `/reset`.
 
-A file created while a course is open but no assignment is goes to
-`workspace/<course>/<code|documents|pdfs>/`; only with nothing open does it land
-in `generated/`. In the dashboard's Files card these are the **Courses** and
-**Other** tabs. Course folders always show; empty scaffolding folders inside an
-assignment stay hidden until something is saved in them.
+</details>
 
-Nothing silently overwrites an existing file. An overwrite opens the approval
-dialog; denying it leaves the original file untouched.
-
----
-
-## Security model
-
-- **Loopback only.** `APP_HOST` is validated at startup. Host and Origin headers
-  are checked on every request.
-- **CSRF guard.** Every state-changing request needs `X-Owlet: 1`, which a
-  cross-site form cannot set.
-- **No Moodle account password handling.** Login is manual in Chrome. The app
-  never asks for, reads, types, logs, or stores your Moodle credentials.
-- **Network credentials are transient.** The one credential field is the optional
-  hidden "Network login" pair for campus HTTP Basic auth. It is passed to Chrome
-  (Playwright `http_credentials`) for that site only, held in memory, cleared on
-  disconnect, and never written to logs, disk, or SQLite.
-- **Read-only Moodle.** No tool can submit, upload, delete, grade, or change
-  account settings. Dangerous paths are blocked even if the model asks.
-- **Untrusted course content.** Page/PDF/document text is explicitly labelled as
-  data, not instructions. Embedded “ignore your rules” text does not override the
-  system prompt.
-- **Approval gate.** Overwrites and workspace refreshes pause until you click
-  Approve. Timeouts deny. Stopping the agent denies everything pending.
-- **Path jail.** All writes are resolved against `workspace/`/`generated/`;
-  traversal, absolute paths, and symlinks are rejected.
-- **No shell, no execution.** Generated code is written to disk and never run.
-- **Local CSP.** `script-src 'self'`, no framing, no MIME sniffing, no caching.
-- **Redaction.** Cookies, tokens, session keys, and secret-looking fields are
-  removed from events and logs; URLs are shown without query strings in the UI.
-
-The dashboard is a local control surface, not a hardened multi-user web app.
-Do not expose port 8765 through a tunnel, reverse proxy, or firewall rule.
-
----
-
-## Tests
+<details>
+<summary><b>Running the tests</b></summary>
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite: config, security, database, parsers, loop, tools, API
+# Fast suite (no browser, no model): 133 passed, 10 skipped
 python -m pytest tests -q
 
-# Optional: real visible Chrome tests (opens and closes a browser window)
-$env:RUN_BROWSER_TESTS="1"
-python -m pytest tests -q
+# Also run the real-Chrome tests (opens a browser window)
+$env:RUN_BROWSER_TESTS="1"; python -m pytest tests -q
 
-# Optional: real Ollama tests (requires qwen3:8b)
-$env:RUN_OLLAMA_TESTS="1"
-python -m pytest tests/test_ollama.py -q
+# Real Ollama tests (needs qwen3:8b)
+$env:RUN_OLLAMA_TESTS="1"; python -m pytest tests/test_ollama.py -q
 ```
 
-The fast suite covers 124 tests plus 10 skipped tests that need a real browser or
-the local model. `tests/test_drafts.py` covers draft review hashing and a scripted
-draft run end to end; `tests/test_extract.py` covers PPTX/DOCX/PDF text extraction
-and the attachment section in `assignment.md`. With `RUN_BROWSER_TESTS=1` the
-browser tests also run, leaving only the Ollama tests skipped. The optional browser
-suite includes:
+The browser suite includes a full mock-Moodle workflow: sync, PDF download and
+read, Word/PDF/code generation, and overwrite denial.
 
-- visible Chrome launch, login detection, and host-policy enforcement
-- live Moodle DOM parsing for courses/assignments/assignment details
-- a complete **mock Moodle → PDF download → PDF read → Word/PDF/code files →
-  workspace persistence → overwrite denial** workflow
-- the automatic sync against a mock Moodle: statuses, calendar due dates, course
-  folders, saved instructions, the teacher's attachment downloaded and the
-  student's own submission file skipped, and a repeat sync that rewrites and
-  re-downloads nothing
+Contributors: please read [AGENTS.md](AGENTS.md) first. It lists the rules every
+change must keep (loopback only, local model only, read-only Moodle, and so on).
 
-The real-model path was also exercised manually through the dashboard: a plain
-answer, a tool-call round with a recoverable browser error, and an approval
-dialog for an overwrite. Those live checks are intentionally not part of the
-default suite because they depend on model speed and local Chrome.
-
-### Verified status
-
-| Phase | Scope | Status |
-| --- | --- | --- |
-| 1 | Environment audit (Windows, Python, Ollama, qwen3, Chrome) | Complete |
-| 2 | Project skeleton, config, logging, security helpers, SQLite | Complete |
-| 3 | Ollama client: health, streaming text, streaming tool calls | Complete |
-| 4 | Visible persistent browser, manual login detection, URL policy | Complete |
-| 5 | Moodle course/assignment parsing from live DOM | Complete |
-| 6 | Tool registry, Pydantic validation, bounded agent loop, approvals | Complete |
-| 7 | Attachment download, resource resolution, PDF extraction | Complete |
-| 8 | Word/PDF/code generation, document reading, overwrite approval | Complete |
-| 9 | FastAPI app, SSE dashboard, file tree, approval UI, API tests | Complete |
-| 10 | End-to-end mock Moodle study workflow | Complete |
-
-Not verified against your real Moodle instance because that requires your manual
-login and your institution's page layout. Private Moodle themes are handled with
-heuristics; if a page is unusual, the agent can still return the visible page
-text via `get_page_content`.
+</details>
 
 ---
 
-## Performance on CPU
+## Contributing
 
-`qwen3:8b` is a large model for CPU-only inference. On the test machine it ran at
-roughly 5 tok/s with a warm model. The first turn after a restart can take
-1–2 minutes because the model is loaded into RAM and the prompt is processed;
-later turns are typically faster (tens of seconds, depending on answer length).
+Issues and pull requests are welcome. Before you start, read
+[AGENTS.md](AGENTS.md), run `python -m pytest tests -q`, and keep the safety
+rules intact: **local only, read-only Moodle, no passwords, nothing runs
+automatically.**
 
-Tips:
+## Disclaimer
 
-- Keep `OLLAMA_KEEP_ALIVE=30m` so the model stays warm.
-- Ask for one step at a time (“list the assignments”, then “open the first one”).
-- Keep `OLLAMA_THINK=false`; thinking mode is much slower on CPU.
-- The UI streams tokens and supports **Stop** without freezing.
-- A GPU-enabled Ollama install will be dramatically faster with the same app.
+Owlet is not affiliated with Moodle. You are responsible for following your
+institution's academic-integrity rules and Moodle terms of use. Owlet never
+submits work on your behalf.
 
----
+## License
 
-## Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| `Address already in use` | Change `APP_PORT` in `.env`, or stop the other process on 8765 |
-| Chrome profile “already in use” | Close the other Chrome window using `browser/profile`, or stop the other Owlet instance |
-| Chrome not found | Install Chrome, or set `BROWSER_CHANNEL=msedge`. For bundled Chromium: `python -m playwright install chromium` |
-| Ollama pill says “offline” | Start the Ollama app / `ollama serve`, then check `ollama list` |
-| qwen3:8b missing | `ollama pull qwen3:8b` |
-| Login not detected | Finish login in the visible Chrome window, open the Moodle dashboard, then click **Check login** |
-| Page parsing looks wrong | Your theme may use unusual markup; ask the agent to read the visible page text, or open the page manually in Chrome |
-| PDF generation fails | Chrome must be available to Playwright (`BROWSER_CHANNEL=chrome`); PDFs render without JavaScript |
-| `403 Missing local request header` | You are calling the API manually; add `-H "X-Owlet: 1"` for POST/PUT/PATCH/DELETE |
-| Browser tests are skipped | Set `$env:RUN_BROWSER_TESTS="1"` (they open a real Chrome window) |
-| Ollama tests are skipped | Set `$env:RUN_OLLAMA_TESTS="1"` after pulling the model |
-| First answer is very slow | Expected on CPU while the model loads; later turns reuse it via `OLLAMA_KEEP_ALIVE` |
-
----
-
-## Privacy and data reset
-
-Local data lives in:
-
-- `database/owlet.db` — courses, assignments, conversations, activity, approvals
-- `config/app_state.json` — the Moodle URL only (never a password)
-- `browser/profile/` — Chrome session for your Moodle login
-- `workspace/` — course material and generated study files
-- `generated/` — files created with no course or assignment open
-- `logs/` — local logs
-
-### Reset from the chat
-
-Type `/reset` in the chat box and confirm. This clears courses, assignments,
-conversations, messages, activity, approvals and everything under `workspace/`
-and `generated/` (only the top-level `.gitkeep` of each stays). Your saved Moodle URL and the
-Chrome login profile are kept, so you do not have to log in again. The command
-is not advertised in the composer any more, but it works the same. A reset is
-refused while a sync is running. After a reset, press **Sync** to fetch
-everything again.
-
-It is also available as `POST /api/reset` with the usual `X-Owlet: 1` header,
-and every open dashboard tab refreshes itself when a reset happens.
-
-To start completely fresh, stop the app first, then remove any of those paths.
-For example:
-
-```powershell
-Remove-Item database\owlet.db -Force
-Remove-Item config\app_state.json -Force
-Remove-Item browser\profile -Recurse -Force
-```
-
-Deleting `workspace/` removes your saved course material and generated files;
-back it up first if you want to keep your work.
-
----
-
-## Known limitations
-
-- Moodle themes and activity plugins differ. Parsers cover common Moodle 4.x
-  markup; unusual pages fall back to visible text rather than guessing.
-- Attachments behind one-time links, external tools, or non-file resources may
-  need to be opened manually.
-- Scanned PDFs without a text layer return little or no text; OCR is not included.
-- The model can make mistakes. Always review explanations and generated files
-  against the actual assignment, and submit manually.
-- CPU inference is slow; this is a local-model tradeoff, not a bug.
-- Only one agent turn runs at a time. The Stop button is cooperative and forces
-  cancellation after 10 seconds.
-- The dashboard is designed for a single local user, not multi-user hosting.
-
----
-
-## License / use
-
-Built as a local study assistant. You are responsible for following your
-institution's academic-integrity rules and Moodle terms of use. Owlet is a
-reading and drafting aid; it does not submit work on your behalf.
+MIT. See [LICENSE](LICENSE).
