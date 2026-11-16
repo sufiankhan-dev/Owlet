@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
@@ -55,6 +55,30 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean, got {raw!r}")
 
 
+def _env_course_urls(name: str) -> frozenset[tuple[str, str]]:
+    """Parse comma-separated Moodle course URLs into (host, course id) pairs."""
+
+    pairs: set[tuple[str, str]] = set()
+    for raw in _env_str(name, "").split(","):
+        url = raw.strip()
+        if not url:
+            continue
+        parsed = urlparse(url)
+        course_id = parse_qs(parsed.query).get("id", [""])[0].strip()
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or "/course/view.php" not in parsed.path.lower()
+            or not course_id
+        ):
+            raise ValueError(
+                f"{name} entries must be Moodle course URLs such as "
+                f"https://moodle.example.edu/course/view.php?id=123, got {url!r}"
+            )
+        pairs.add((parsed.netloc.lower(), course_id))
+    return frozenset(pairs)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime settings for the whole application."""
@@ -77,6 +101,8 @@ class Settings:
     browser_timeout_ms: int
     browser_profile_dir: Path
     moodle_url: str | None
+    # Courses hidden everywhere, as (host, Moodle course id) from IGNORED_COURSES.
+    ignored_courses: frozenset[tuple[str, str]]
 
     max_download_mb: int
     max_page_chars: int
@@ -204,6 +230,7 @@ def load_settings() -> Settings:
         browser_timeout_ms=_env_int("BROWSER_TIMEOUT_MS", 30000, 5000, 180000),
         browser_profile_dir=profile,
         moodle_url=moodle_url,
+        ignored_courses=_env_course_urls("IGNORED_COURSES"),
         max_download_mb=_env_int("MAX_DOWNLOAD_MB", 50, 1, 500),
         max_page_chars=_env_int("MAX_PAGE_CHARS", 14000, 2000, 100000),
         max_tool_result_chars=_env_int("MAX_TOOL_RESULT_CHARS", 8000, 1000, 50000),

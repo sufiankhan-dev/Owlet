@@ -255,18 +255,18 @@ def _course_key(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?id={course_id}"
 
 
-#: Courses the owner asked to hide everywhere, as (host, Moodle course id).
-#: "Programming Fundamentals Lab (BS-SE-1B)" shows on the dashboard but is not
-#: one of the owner's courses.
-IGNORED_COURSES: frozenset[tuple[str, str]] = frozenset({("lms.dsu.edu.pk", "6870")})
+def is_ignored_course(url: str, ignored: frozenset[tuple[str, str]] = frozenset()) -> bool:
+    """True when ``url`` is a course page listed in ``ignored``.
 
+    ``ignored`` holds (host, Moodle course id) pairs, normally
+    ``settings.ignored_courses`` from the ``IGNORED_COURSES`` env var.
+    """
 
-def is_ignored_course(url: str) -> bool:
-    """True when ``url`` is a course page the owner asked to ignore."""
-
+    if not ignored:
+        return False
     parsed = urlparse(url or "")
     course_id = parse_qs(parsed.query).get("id", [""])[0]
-    return (parsed.netloc.lower(), course_id) in IGNORED_COURSES
+    return (parsed.netloc.lower(), course_id) in ignored
 
 
 _CODE_LABEL = re.compile(r"[A-Z0-9][A-Z0-9 \-_/.()]*")
@@ -361,7 +361,9 @@ def course_name_from_heading(
     return parse_course_display_name(fragment, site_title=site_title)
 
 
-def parse_courses(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+def parse_courses(
+    snapshot: dict[str, Any], ignored: frozenset[tuple[str, str]] = frozenset()
+) -> list[dict[str, Any]]:
     """Extract unique courses from any Moodle page that links to courses.
 
     Moodle themes differ: standard themes render ``/course/view.php?id=N``
@@ -372,7 +374,8 @@ def parse_courses(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     The same course is usually listed twice (fullname and shortname, or a card
     and its anchor), so labels are ranked: a readable name always beats a code
     such as ``BS-1402-BS-261-BS-SE-5A``, then card labels beat loose anchors,
-    then the richer label wins.
+    then the richer label wins. Courses in ``ignored`` (host, course id) are
+    dropped.
     """
 
     courses: dict[str, dict[str, Any]] = {}
@@ -414,7 +417,7 @@ def parse_courses(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
             key = _course_key(href)
         else:
             key = f"{origin}/course/view.php?id={course_id}"
-        if is_ignored_course(key):
+        if is_ignored_course(key, ignored):
             return
         cleaned = " ".join(str(name).split())
         placeholder_label = is_placeholder_course_name(cleaned, course_id)

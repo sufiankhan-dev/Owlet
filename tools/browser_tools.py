@@ -302,7 +302,7 @@ async def _load_courses(ctx: ToolContext) -> list[dict[str, Any]]:
                 raise ToolError(
                     "Moodle redirected to the login page. Log in manually in Chrome, then retry."
                 )
-            courses = parse_courses(snapshot)
+            courses = parse_courses(snapshot, ctx.settings.ignored_courses)
             if not courses:
                 # Slow AJAX dashboards sometimes fill in a beat after the selector
                 # fires; re-read once before giving up on this page.
@@ -310,12 +310,14 @@ async def _load_courses(ctx: ToolContext) -> list[dict[str, Any]]:
                 snapshot = await take_snapshot(
                     ctx.browser.page, max_chars=ctx.settings.max_page_chars
                 )
-                courses = parse_courses(snapshot)
+                courses = parse_courses(snapshot, ctx.settings.ignored_courses)
             if courses:
                 await _resolve_course_names(ctx, courses)
                 ctx.db.prune_site_course()
                 ctx.db.prune_courses(
-                    row["id"] for row in ctx.db.list_courses() if is_ignored_course(row["url"])
+                    row["id"]
+                    for row in ctx.db.list_courses()
+                    if is_ignored_course(row["url"], ctx.settings.ignored_courses)
                 )
                 for course in courses:
                     course["db_id"] = ctx.db.upsert_course(

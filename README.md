@@ -198,9 +198,11 @@ Everything works without a `.env` file. To change settings, copy
 | `SYNC_ON_CONNECT` | `true` | Sync automatically once login is detected |
 | `DUE_SOON_HOURS` | `48` | Amber badge threshold |
 | `DUE_URGENT_HOURS` | `24` | Red badge threshold; must not exceed `DUE_SOON_HOURS` |
+| `IGNORED_COURSES` | *(empty)* | Comma-separated course URLs to hide everywhere |
 
-Courses listed in `IGNORED_COURSES` (`browser/moodle.py`, by host and course id)
-are skipped everywhere.
+`IGNORED_COURSES` takes course page URLs such as
+`https://moodle.example.edu/course/view.php?id=123`. A course is matched by host
+and course id, so the same id on another Moodle is not hidden.
 
 </details>
 
@@ -320,7 +322,7 @@ API routes for drafts: `GET /api/assignments/{id}/draft`,
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite (no browser, no model): 133 passed, 10 skipped
+# Fast suite (no browser, no model): 135 passed, 10 skipped
 python -m pytest tests -q
 
 # Also run the real-Chrome tests (opens a browser window)

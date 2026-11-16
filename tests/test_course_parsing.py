@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from browser.moodle import (
     course_name_from_heading,
     is_placeholder_course_name,
@@ -202,23 +204,48 @@ def test_course_without_a_label_is_reported_as_a_placeholder() -> None:
     assert courses[0]["placeholder_name"] is True
 
 
+IGNORED = frozenset({("lms.example.edu", "6870")})
+
+
 def test_ignored_course_is_dropped_from_links_and_cards() -> None:
     snapshot = _snapshot(
-        url="https://lms.dsu.edu.pk/my/",
         links=[
             ("Programming Fundamentals Lab(BS-SE-1B)",
-             "https://lms.dsu.edu.pk/course/view.php?id=6870", "link"),
-            ("Database Systems", "https://lms.dsu.edu.pk/course/view.php?id=6871", "link"),
+             "https://lms.example.edu/course/view.php?id=6870", "link"),
+            ("Database Systems", "https://lms.example.edu/course/view.php?id=6871", "link"),
         ],
         cards=[{"course_id": "6870", "name": "Programming Fundamentals Lab", "href": ""}],
     )
 
-    assert [c["course_id"] for c in parse_courses(snapshot)] == ["6871"]
+    assert [c["course_id"] for c in parse_courses(snapshot, IGNORED)] == ["6871"]
 
 
-def test_same_course_id_on_another_moodle_is_not_ignored() -> None:
+def test_no_course_is_ignored_by_default() -> None:
     snapshot = _snapshot(
         links=[("Algebra", "https://lms.example.edu/course/view.php?id=6870", "link")]
     )
 
     assert [c["course_id"] for c in parse_courses(snapshot)] == ["6870"]
+
+
+def test_same_course_id_on_another_moodle_is_not_ignored() -> None:
+    snapshot = _snapshot(
+        url="https://moodle.other.edu/my/",
+        links=[("Algebra", "https://moodle.other.edu/course/view.php?id=6870", "link")],
+    )
+
+    assert [c["course_id"] for c in parse_courses(snapshot, IGNORED)] == ["6870"]
+
+
+def test_ignored_courses_are_read_from_the_env(monkeypatch) -> None:
+    from app.config import load_settings
+
+    monkeypatch.setenv(
+        "IGNORED_COURSES",
+        " https://LMS.example.edu/course/view.php?id=6870 , https://lms.example.edu/course/view.php?id=7&lang=en",
+    )
+    assert load_settings().ignored_courses == {("lms.example.edu", "6870"), ("lms.example.edu", "7")}
+
+    monkeypatch.setenv("IGNORED_COURSES", "https://lms.example.edu/my/")
+    with pytest.raises(ValueError, match="IGNORED_COURSES"):
+        load_settings()
