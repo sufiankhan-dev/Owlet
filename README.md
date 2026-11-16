@@ -189,7 +189,7 @@ Everything works without a `.env` file. To change settings, copy
 | `BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` |
 | `BROWSER_HEADLESS` | `false` | Must stay `false` for manual login and oversight |
 | `BROWSER_TIMEOUT_MS` | `30000` | Page navigation timeout |
-| `MOODLE_URL` | `https://lms.dsu.edu.pk/` | Default Moodle; change it here or in the dashboard |
+| `MOODLE_URL` | *(empty)* | Your Moodle site; or set it in the dashboard |
 | `MAX_DOWNLOAD_MB` | `50` | Attachment size cap |
 | `MAX_PAGE_CHARS` | `14000` | Page text sent to the model |
 | `MAX_TOOL_RESULT_CHARS` | `8000` | Tool result cap |

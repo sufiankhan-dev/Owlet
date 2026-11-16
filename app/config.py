@@ -165,7 +165,7 @@ def load_settings() -> Settings:
             "Remote/cloud inference is deliberately unsupported."
         )
 
-    moodle_url = _env_str("MOODLE_URL", "https://lms.dsu.edu.pk/") or None
+    moodle_url = _env_str("MOODLE_URL", "") or None
     if moodle_url:
         parsed_moodle = urlparse(moodle_url)
         if parsed_moodle.scheme not in {"http", "https"} or not parsed_moodle.hostname:
