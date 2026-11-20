@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# The one place the default model is named. Override it with OLLAMA_MODEL.
+DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -105,6 +107,9 @@ class Settings:
     ignored_courses: frozenset[tuple[str, str]]
 
     max_download_mb: int
+    # Chat image attachments: per-image size cap and how many one message may carry.
+    max_image_mb: int
+    max_images_per_message: int
     max_page_chars: int
     max_tool_result_chars: int
     approval_timeout_s: int
@@ -145,12 +150,25 @@ class Settings:
         return self.project_root / "logs"
 
     @property
+    def chat_images_dir(self) -> Path:
+        """Attached chat images, kept outside the user's workspace.
+
+        The database stores only a reference; the bytes live here so SQLite
+        stays small and history can be re-rendered after a reload.
+        """
+        return self.database_dir / "chat_images"
+
+    @property
     def config_dir(self) -> Path:
         return self.project_root / "config"
 
     @property
     def max_download_bytes(self) -> int:
         return self.max_download_mb * 1024 * 1024
+
+    @property
+    def max_image_bytes(self) -> int:
+        return self.max_image_mb * 1024 * 1024
 
     @property
     def moodle_host(self) -> str | None:
@@ -165,6 +183,7 @@ class Settings:
             self.workspace_dir,
             self.generated_dir,
             self.database_dir,
+            self.chat_images_dir,
             self.logs_dir,
             self.browser_profile_dir,
             self.config_dir,
@@ -219,7 +238,7 @@ def load_settings() -> Settings:
         app_port=_env_int("APP_PORT", 8765, 1024, 65535),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         ollama_host=ollama_host,
-        ollama_model=_env_str("OLLAMA_MODEL", "qwen3:8b"),
+        ollama_model=_env_str("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         ollama_num_ctx=_env_int("OLLAMA_NUM_CTX", 16384, 2048, 65536),
         ollama_temperature=_env_float("OLLAMA_TEMPERATURE", 0.2, 0.0, 2.0),
         ollama_timeout_s=_env_int("OLLAMA_TIMEOUT_S", 600, 30, 3600),
@@ -232,6 +251,8 @@ def load_settings() -> Settings:
         moodle_url=moodle_url,
         ignored_courses=_env_course_urls("IGNORED_COURSES"),
         max_download_mb=_env_int("MAX_DOWNLOAD_MB", 50, 1, 500),
+        max_image_mb=_env_int("MAX_IMAGE_MB", 8, 1, 20),
+        max_images_per_message=_env_int("MAX_IMAGES_PER_MESSAGE", 4, 1, 10),
         max_page_chars=_env_int("MAX_PAGE_CHARS", 14000, 2000, 100000),
         max_tool_result_chars=_env_int("MAX_TOOL_RESULT_CHARS", 8000, 1000, 50000),
         approval_timeout_s=_env_int("APPROVAL_TIMEOUT_S", 300, 30, 3600),

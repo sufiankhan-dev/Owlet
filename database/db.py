@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL DEFAULT '',
     tool_calls TEXT,
+    images TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
@@ -98,6 +99,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("assignments", "due_at", "TEXT"),
     ("assignments", "status", "TEXT NOT NULL DEFAULT 'unknown'"),
     ("assignments", "last_synced_at", "TEXT"),
+    ("messages", "images", "TEXT"),
 )
 
 
@@ -170,14 +172,16 @@ class Database:
         role: str,
         content: str,
         tool_calls: Any | None = None,
+        images: list[dict[str, Any]] | None = None,
     ) -> int:
         now = _utc_now()
         payload = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        image_payload = json.dumps(images, ensure_ascii=False) if images else None
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO messages(conversation_id, role, content, tool_calls, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (conversation_id, role, content, payload, now),
+                "INSERT INTO messages(conversation_id, role, content, tool_calls, images, "
+                "created_at) VALUES (?,?,?,?,?,?)",
+                (conversation_id, role, content, payload, image_payload, now),
             )
             self._conn.execute(
                 "UPDATE conversations SET updated_at=? WHERE id=?", (now, conversation_id)
@@ -188,26 +192,31 @@ class Database:
     def get_messages(self, conversation_id: int, limit: int = 60) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, role, content, tool_calls, created_at FROM messages "
+                "SELECT id, role, content, tool_calls, images, created_at FROM messages "
                 "WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
                 (conversation_id, limit),
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in reversed(rows):
             item = dict(row)
-            if item.get("tool_calls"):
-                try:
-                    item["tool_calls"] = json.loads(item["tool_calls"])
-                except json.JSONDecodeError:
-                    item["tool_calls"] = None
+            for column in ("tool_calls", "images"):
+                if item.get(column):
+                    try:
+                        item[column] = json.loads(item[column])
+                    except json.JSONDecodeError:
+                        item[column] = None
+                else:
+                    item[column] = None
             result.append(item)
         return result
 
     def list_conversations(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, title, created_at, updated_at FROM conversations "
-                "ORDER BY updated_at DESC LIMIT ?",
+                "SELECT c.id, c.title, c.created_at, c.updated_at, "
+                "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) "
+                "AS message_count "
+                "FROM conversations c ORDER BY c.updated_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -218,6 +227,71 @@ class Database:
                 "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)
             ).fetchone()
         return row is not None
+
+    def rename_conversation(self, conversation_id: int, title: str) -> bool:
+        cleaned = " ".join(str(title or "").split())[:120]
+        if not cleaned:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET title=? WHERE id=?", (cleaned, conversation_id)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def conversation_images(self, conversation_id: int) -> list[dict[str, Any]]:
+        """Every image reference stored on the conversation's messages."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT images FROM messages WHERE conversation_id=? AND images IS NOT NULL",
+                (conversation_id,),
+            ).fetchall()
+        refs: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                parsed = json.loads(row["images"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, list):
+                refs.extend(item for item in parsed if isinstance(item, dict))
+        return refs
+
+    def delete_conversation(self, conversation_id: int) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM conversations WHERE id=?", (conversation_id,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def last_user_message(self, conversation_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, content, images, created_at FROM messages "
+                "WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        if item.get("images"):
+            try:
+                item["images"] = json.loads(item["images"])
+            except json.JSONDecodeError:
+                item["images"] = None
+        return item
+
+    def delete_replies_after(self, conversation_id: int, message_id: int) -> int:
+        """Delete assistant rows after a user message, for Regenerate."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM messages WHERE conversation_id=? AND id>? AND role='assistant'",
+                (conversation_id, int(message_id)),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     # ---------- courses & assignments ----------
 

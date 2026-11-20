@@ -1,4 +1,4 @@
-"""Read-only Moodle browser tools exposed to qwen3:8b.
+"""Read-only Moodle browser tools exposed to the model.
 
 Every handler validates arguments, emits activity events, and returns compact
 JSON. Nothing here can submit, upload, delete, or change Moodle data.

@@ -5,7 +5,7 @@ an AI agent. Read it at the start of a session. If a request conflicts with a ru
 here, say so and ask before proceeding.
 
 **Stack:** Python 3.11+ (verified 3.14.3) · FastAPI · Playwright · local Ollama
-(`qwen3:8b`) · SQLite. Dashboard is vanilla HTML/CSS/JS served by FastAPI: no
+(`qwen3.5:9b`) · SQLite. Dashboard is vanilla HTML/CSS/JS served by FastAPI: no
 Node, no build step (§6). **No cloud AI, no API keys, ever.**
 
 ---
@@ -40,6 +40,7 @@ app/
   api.py                # FastAPI app, ~26 routes, SSE at /api/events, local_only middleware
   state.py              # AppState: run lifecycle, approvals, snapshots, reset
   config.py             # frozen Settings dataclass, validated from env; ensure_directories()
+  chat_images.py        # chat attachment validation, local storage, prompt encoding
   security.py           # URL policy, PathJail, filename sanitization, truncate_text
   events.py             # in-process pub/sub feeding SSE
   logging_setup.py      # rotating file + console logs, redaction
@@ -80,7 +81,7 @@ python -m pytest tests -q
 # real Chrome tests (opens a browser window)
 $env:RUN_BROWSER_TESTS="1"; python -m pytest tests -q
 
-# real Ollama tests (needs qwen3:8b pulled)
+# real Ollama tests (needs qwen3.5:9b pulled)
 $env:RUN_OLLAMA_TESTS="1"; python -m pytest tests/test_ollama.py -q
 
 # single file / single test

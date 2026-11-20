@@ -16,8 +16,9 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from app.chat_images import ImageAttachmentError
 from app.config import load_settings
 from app.state import AppState, BusyError
 from browser.session import BrowserError
@@ -26,9 +27,34 @@ logger = logging.getLogger(__name__)
 API_VERSION = "0.1.0"
 
 
+class ChatImage(BaseModel):
+    """One attached image, base64-encoded by the dashboard."""
+
+    name: str = Field(default="image", max_length=200)
+    mime: str = Field(default="", max_length=100)
+    data: str = Field(min_length=1, max_length=40_000_000)
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(default="", max_length=8000)
     conversation_id: int | None = None
+    images: list[ChatImage] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def _needs_question_or_image(self) -> "ChatRequest":
+        # Exactly-empty is a schema error (422); whitespace-only is a normal,
+        # clear 400 from the state layer, which the dashboard can show.
+        if self.message == "" and not self.images:
+            raise ValueError("Write a message or attach an image first.")
+        return self
+
+
+class RegenerateRequest(BaseModel):
+    conversation_id: int
+
+
+class RenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
 
 
 class ConnectRequest(BaseModel):
@@ -218,13 +244,42 @@ def create_app(injected_state: AppState | None = None) -> FastAPI:
     async def chat(payload: ChatRequest, state: AppState = Depends(get_state)) -> dict[str, Any]:
         try:
             conversation_id, run_id = await state.start_chat(
-                payload.message, payload.conversation_id
+                payload.message,
+                payload.conversation_id,
+                images=[image.model_dump() for image in payload.images],
             )
         except BusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"conversation_id": conversation_id, "run_id": run_id}
+
+    @app.post("/api/chat/regenerate")
+    async def regenerate(
+        payload: RegenerateRequest, state: AppState = Depends(get_state)
+    ) -> dict[str, Any]:
+        try:
+            return await state.regenerate(payload.conversation_id)
+        except BusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/chat/images/{conversation_id}/{file_name}")
+    async def chat_image(
+        conversation_id: int,
+        file_name: str,
+        state: AppState = Depends(get_state),
+    ) -> Response:
+        try:
+            payload, mime = state.chat_image(conversation_id, file_name)
+        except (ImageAttachmentError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(
+            content=payload,
+            media_type=mime,
+            headers={"Content-Disposition": "inline"},
+        )
 
     @app.post("/api/agent/stop")
     async def stop_agent(state: AppState = Depends(get_state)) -> dict[str, Any]:
@@ -367,6 +422,28 @@ def create_app(injected_state: AppState | None = None) -> FastAPI:
     @app.get("/api/conversations")
     async def conversations(state: AppState = Depends(get_state)) -> dict[str, Any]:
         return {"conversations": state.db.list_conversations(50)}
+
+    @app.patch("/api/conversations/{conversation_id}")
+    async def rename_conversation(
+        conversation_id: int, payload: RenameRequest, state: AppState = Depends(get_state)
+    ) -> dict[str, Any]:
+        try:
+            return state.rename_conversation(conversation_id, payload.title)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/conversations/{conversation_id}")
+    async def delete_conversation(
+        conversation_id: int, state: AppState = Depends(get_state)
+    ) -> dict[str, Any]:
+        try:
+            return state.delete_conversation(conversation_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except BusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/conversations/{conversation_id}/messages")
     async def conversation_messages(

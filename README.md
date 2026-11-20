@@ -28,6 +28,8 @@ assignment, plan your work, or draft a first version of the deliverables.
 | **Shows what's urgent** | Assignments get a badge: red for **overdue** or due within 24 hours, amber for due within 48 hours. |
 | **Organises your files** | One folder per course, one per assignment, with the instructions and attachments already inside. |
 | **Answers questions** | Ask "What should I do first?", "Explain this assignment", or "Summarise this course". |
+| **Understands images** | Attach a screenshot, photo, or diagram (or drag/drop and paste it) and ask about it. Follow-up questions keep earlier images in context. |
+| **Keeps your chats** | Every conversation is saved. Reopen, rename, or delete one; copy an answer, regenerate the last reply, or stop a long run. |
 | **Drafts assignments** | One click writes a first draft (Word, PDF, or code) plus a checklist of requirements. You review it and submit it yourself. |
 | **Reads documents** | PDF, Word, PowerPoint (slides and notes), text, and code files. |
 
@@ -50,7 +52,8 @@ assignment, plan your work, or draft a first version of the deliverables.
 - **Python 3.11 or newer**: [python.org/downloads](https://www.python.org/downloads/)
 - **Google Chrome** (Microsoft Edge works too)
 - **Ollama**: [ollama.com](https://ollama.com/)
-- About **8 GB of free RAM** for the AI model (a GPU helps but isn't required)
+- At least **8 GB of free RAM** for the 9B model (more is better if the model
+  shares the machine with Chrome)
 
 ### Install (one time)
 
@@ -64,8 +67,8 @@ cd Owlet
 # 2. Install the Python packages
 python -m pip install -r requirements.txt
 
-# 3. Download the AI model (about 5 GB)
-ollama pull qwen3:8b
+# 3. Download the AI model (several GB, one time)
+ollama pull qwen3.5:9b
 ```
 
 ### Start Owlet
@@ -84,7 +87,8 @@ Then open **http://127.0.0.1:8765** in your browser.
 3. **Log in to Moodle in that Chrome window**, the same way you normally do.
 4. Wait a moment. Owlet notices you're logged in and starts syncing your courses
    and assignments automatically.
-5. Start chatting, or press **Draft** next to any assignment.
+5. Start chatting, or press **Draft** next to any assignment. Use the paperclip
+   to attach a screenshot or photo, or paste/drop images straight into the chat.
 
 Chrome remembers your login, so next time you usually won't need to log in again.
 
@@ -132,9 +136,9 @@ workspace/
 Owlet never silently overwrites a file. If it needs to replace one, it asks you
 first, and saying no keeps the original.
 
-**Start fresh:** type `/reset` in the chat. This clears synced data and
-everything in `workspace/` and `generated/`, but keeps your Moodle address and
-Chrome login.
+**Start fresh:** type `/reset` in the chat. This clears synced data, chats,
+attached chat images, and everything in `workspace/` and `generated/`, but keeps
+your Moodle address and Chrome login.
 
 ---
 
@@ -143,7 +147,7 @@ Chrome login.
 | Problem | Fix |
 | --- | --- |
 | Ollama shows **offline** | Start the Ollama app (or run `ollama serve`), then check `ollama list`. |
-| The model is missing | Run `ollama pull qwen3:8b`. |
+| The model is missing | Run `ollama pull qwen3.5:9b`. |
 | The first answer is very slow | Normal on a CPU: the model is loading. Later answers are faster. |
 | Login isn't detected | Finish logging in, open your Moodle dashboard in Chrome, then click **Check login**. |
 | "Profile already in use" | Close the other Chrome window Owlet opened, or the other copy of Owlet. |
@@ -151,9 +155,9 @@ Chrome login.
 | "Address already in use" | Another program uses port 8765. Change `APP_PORT` in `.env`. |
 | Courses or assignments look wrong | Your school's Moodle theme may be unusual. Ask Owlet to read the visible page, or open it yourself. |
 
-**About speed:** on a CPU, `qwen3:8b` writes around 5 words per second, and the
-first reply after starting can take 1–2 minutes. With a GPU it's much faster.
-Asking for one step at a time helps.
+**About speed:** on a CPU, a 9B model generates only a few words per second, and
+the first reply after starting can take a couple of minutes while the model
+loads. With a GPU it's much faster. Asking for one step at a time helps.
 
 ---
 
@@ -163,6 +167,12 @@ Asking for one step at a time helps.
   back to plain page text when a page is unusual.
 - Scanned PDFs (images with no text) can't be read. There's no OCR.
 - Old `.doc` and `.ppt` files aren't read; `.docx` and `.pptx` are.
+- Image questions need a vision-capable model. Owlet reports what the installed
+  model advertises, but the model is the final authority; if it rejects an image,
+  the chat shows its exact error.
+- Chat images are kept as local files under `database/chat_images/` and are
+  downscaled in the browser to keep requests small; very large originals are not
+  preserved.
 - The AI makes mistakes. Always check its work against the real assignment.
 - Built for one person on one computer, not as a shared web server.
 
@@ -181,11 +191,13 @@ Everything works without a `.env` file. To change settings, copy
 | `APP_HOST` | `127.0.0.1` | Must be loopback; anything else is refused |
 | `APP_PORT` | `8765` | One process serves the API and the dashboard |
 | `OLLAMA_HOST` | `http://localhost:11434` | Must be local |
-| `OLLAMA_MODEL` | `qwen3:8b` | Other local models work; the app is tuned for qwen3 |
+| `OLLAMA_MODEL` | `qwen3.5:9b` | Other local models work; the app is tuned for this model |
 | `OLLAMA_NUM_CTX` | `16384` | Context window |
 | `OLLAMA_TEMPERATURE` | `0.2` | Lower is more predictable |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the model loaded between turns |
 | `OLLAMA_THINK` | `false` | Thinking mode roughly doubles CPU latency |
+| `MAX_IMAGE_MB` | `8` | Per-image cap after the browser downscales it |
+| `MAX_IMAGES_PER_MESSAGE` | `4` | Attachments allowed on one message |
 | `BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` |
 | `BROWSER_HEADLESS` | `false` | Must stay `false` for manual login and oversight |
 | `BROWSER_TIMEOUT_MS` | `30000` | Page navigation timeout |
@@ -218,9 +230,10 @@ Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
    FastAPI + SSE  <---- events/approvals ----  Agent loop (validated tool calls)
         |                                                  |
         v                                                  v
-   Dashboard (127.0.0.1:8765)                    Ollama qwen3:8b (localhost)
+   Dashboard (127.0.0.1:8765)                    Ollama qwen3.5:9b (localhost)
         |
         +--> SQLite (courses, assignments, conversations, activity, approvals)
+        +--> database/chat_images/ (attached chat images)
         +--> workspace/ (course material, generated files)
 ```
 
@@ -234,8 +247,10 @@ Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
   fetched.
 - **A chat turn** is a bounded loop: the model proposes tool calls, they are
   validated with Pydantic, run against the browser or workspace, and the results
-  go back to the model. Overwrites pause for your approval. Answers stream over
-  Server-Sent Events and are saved in SQLite. **Stop** works between every step.
+  go back to the model. Attached images are re-encoded from disk into the prompt,
+  newest first and within a byte budget, so follow-up questions still see them.
+  Overwrites pause for your approval. Answers stream over Server-Sent Events and
+  are saved in SQLite. **Stop** works between every step.
 
 </details>
 
@@ -306,11 +321,16 @@ Owlet/
 └── generated/           # files made with no course open (gitignored)
 ```
 
-Local data: `database/owlet.db`, `config/app_state.json` (Moodle URL only),
-`browser/profile/` (Chrome login), `workspace/`, `generated/`, `logs/`.
+Local data: `database/owlet.db`, `database/chat_images/` (attached chat images),
+`config/app_state.json` (Moodle URL only), `browser/profile/` (Chrome login),
+`workspace/`, `generated/`, `logs/`.
 Stop the app and delete these to wipe everything.
 
-API routes for drafts: `GET /api/assignments/{id}/draft`,
+Chat API routes: `POST /api/chat` (text, optional `images`),
+`POST /api/chat/regenerate`, `GET /api/chat/images/{conversation}/{file}`,
+`GET/PATCH/DELETE /api/conversations`, and
+`GET /api/conversations/{id}/messages`.
+Draft routes: `GET /api/assignments/{id}/draft`,
 `POST /api/assignments/{id}/draft`, `POST /api/assignments/{id}/review`.
 `POST /api/reset` does the same as `/reset`.
 
@@ -322,13 +342,13 @@ API routes for drafts: `GET /api/assignments/{id}/draft`,
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite (no browser, no model): 135 passed, 10 skipped
+# Fast suite (no browser, no model): 154 passed, 10 skipped
 python -m pytest tests -q
 
 # Also run the real-Chrome tests (opens a browser window)
 $env:RUN_BROWSER_TESTS="1"; python -m pytest tests -q
 
-# Real Ollama tests (needs qwen3:8b)
+# Real Ollama tests (needs qwen3.5:9b)
 $env:RUN_OLLAMA_TESTS="1"; python -m pytest tests/test_ollama.py -q
 ```
 

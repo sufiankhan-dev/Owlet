@@ -44,14 +44,14 @@ async def _with_service(coro_factory):
         await service.aclose()
 
 
-def test_health_reports_qwen3() -> None:
+def test_health_reports_the_configured_model() -> None:
     async def scenario(service: OllamaService):
         return await service.health()
 
     health = asyncio.run(_with_service(scenario))
     assert health["reachable"], health["error"]
     assert health["installed"], health["error"]
-    assert health["model"] == "qwen3:8b"
+    assert health["model"] == load_settings().ollama_model
 
 
 def test_streaming_tool_call() -> None:
@@ -63,7 +63,7 @@ def test_streaming_tool_call() -> None:
         )
 
     result = asyncio.run(_with_service(scenario))
-    assert result.tool_calls, "expected qwen3:8b to request open_course"
+    assert result.tool_calls, "expected the configured model to request open_course"
     call = result.tool_calls[0]
     assert call.name == "open_course"
     assert call.arguments.get("course_name")

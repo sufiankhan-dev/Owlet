@@ -3,7 +3,7 @@
 Moodle themes differ, so extraction is layered:
 1. Prefer the main content region (``#region-main`` / ``[role=main]``).
 2. Collect semantic markers (activities, assignment links, attachments).
-3. Always return the visible text so qwen3:8b can reason about what is there.
+3. Always return the visible text so the model can reason about what is there.
 
 Nothing in this module trusts page text as instructions; it is returned as data.
 """

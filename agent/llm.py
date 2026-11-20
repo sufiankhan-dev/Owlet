@@ -33,6 +33,35 @@ class LLMError(RuntimeError):
         self.message = message
 
 
+def normalize_model(name: str) -> str:
+    """Canonical, tag-aware model name used for comparisons and display."""
+    return str(name or "").strip().lower()
+
+
+def model_matches(configured: str, installed: str) -> bool:
+    """True when an installed Ollama tag satisfies the configured model.
+
+    ``qwen3.5:9b`` matches itself and a quantised tag such as
+    ``qwen3.5:9b-q4_K_M``; an untagged name matches its ``:latest`` tag.
+    """
+
+    wanted = normalize_model(configured)
+    found = normalize_model(installed)
+    if not wanted or not found:
+        return False
+    if wanted == found:
+        return True
+    if ":" not in wanted and found == f"{wanted}:latest":
+        return True
+    if found.startswith(f"{wanted}-"):
+        return True
+    return False
+
+
+def has_image_content(messages: Sequence[dict[str, Any]]) -> bool:
+    return any(message.get("images") for message in messages)
+
+
 @dataclass(frozen=True)
 class ToolCallRequest:
     """A normalized tool call requested by the model."""
@@ -148,13 +177,17 @@ class OllamaService:
                 "model": self.settings.ollama_model,
                 "installed": False,
                 "models": [],
+                "capabilities": [],
+                "vision": None,
+                "thinking": None,
                 "error": exc.message,
                 "error_kind": exc.kind,
                 "latency_ms": None,
             }
 
-        names = {m["name"] for m in models}
-        installed = self.settings.ollama_model in names
+        installed = any(
+            model_matches(self.settings.ollama_model, m["name"]) for m in models
+        )
         running: list[str] = []
         try:
             ps_response = await self._client.ps()
@@ -164,6 +197,8 @@ class OllamaService:
         except Exception:  # ps is diagnostic only; never fail health because of it
             running = []
 
+        capabilities = await self.capabilities() if installed else []
+
         return {
             "ok": installed,
             "reachable": True,
@@ -172,12 +207,30 @@ class OllamaService:
             "installed": installed,
             "models": models,
             "running": running,
+            "capabilities": capabilities,
+            "vision": ("vision" in capabilities) if capabilities else None,
+            "thinking": ("thinking" in capabilities) if capabilities else None,
             "error": None if installed else (
                 f"Model {self.settings.ollama_model!r} is not installed. "
                 f"Run: ollama pull {self.settings.ollama_model}"
             ),
             "latency_ms": round((time.perf_counter() - started) * 1000, 1),
         }
+
+    async def capabilities(self, model: str | None = None) -> list[str]:
+        """Advertised model capabilities (vision, tools, thinking).
+
+        Older Ollama daemons do not report capabilities, so an empty list means
+        "unknown", never "unsupported".
+        """
+
+        try:
+            info = await self._client.show(model or self.settings.ollama_model)
+        except Exception:
+            logger.debug("Ollama show() failed", exc_info=True)
+            return []
+        return [str(item) for item in (getattr(info, "capabilities", None) or [])]
+
 
     # ---------- chat ----------
 
@@ -223,8 +276,27 @@ class OllamaService:
         tool_calls: list[ToolCallRequest] = []
         final: Any = None
 
+        async def open_stream() -> Any:
+            """Start the stream, dropping ``think`` for models without it."""
+            try:
+                return await self._client.chat(**kwargs)
+            except ResponseError as exc:
+                detail = str(getattr(exc, "error", "") or exc).lower()
+                if "think" in detail and kwargs.get("think") is not None:
+                    logger.info("Model does not support thinking; retrying without it")
+                    fallback = dict(kwargs)
+                    fallback.pop("think", None)
+                    return await self._client.chat(**fallback)
+                raise
+            except ValueError as exc:
+                # The SDK raises this while normalising image payloads.
+                raise LLMError(
+                    f"Ollama could not read the attached image: {exc}",
+                    kind="vision",
+                ) from exc
+
         try:
-            stream = await self._client.chat(**kwargs)
+            stream = await open_stream()
             async for part in stream:
                 if should_stop is not None and should_stop():
                     logger.info("Generation cancelled by user")
@@ -255,14 +327,25 @@ class OllamaService:
                 if getattr(part, "done", False):
                     final = part
 
+        except LLMError:
+            raise
         except ResponseError as exc:
-            if getattr(exc, "status_code", None) == 404:
+            detail = str(getattr(exc, "error", "") or "")
+            lowered = detail.lower()
+            if getattr(exc, "status_code", None) == 404 or "not found" in lowered:
                 raise LLMError(
                     f"Model {self.settings.ollama_model!r} is not installed. "
                     f"Run: ollama pull {self.settings.ollama_model}",
                     kind="model_missing",
                 ) from exc
-            raise LLMError(f"Ollama error: {exc.error}", kind="daemon") from exc
+            if "image" in lowered or "vision" in lowered:
+                raise LLMError(
+                    f"{self.settings.ollama_model!r} could not accept the attached image. "
+                    "Use a vision-capable model or remove the image. "
+                    f"Ollama said: {detail or 'image input rejected'}",
+                    kind="vision",
+                ) from exc
+            raise LLMError(f"Ollama error: {detail or exc}", kind="daemon") from exc
         except (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError, OSError) as exc:
             raise LLMError(
                 f"Lost connection to Ollama at {self.settings.ollama_host}. "

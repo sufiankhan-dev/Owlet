@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.llm import LLMResult, ToolCallRequest
+from agent.llm import LLMError, LLMResult, ToolCallRequest
 from agent.loop import AgentRun, MoodleAgent
 from app.config import load_settings
 from database.db import Database
@@ -216,6 +216,35 @@ def test_cancelled_result_is_not_saved_as_answer(base) -> None:
     )
     assert outcome.cancelled is True
     assert outcome.content == ""
+
+
+def test_model_failure_emits_one_error_event(base) -> None:
+    settings, db, conversation_id, registry, _executed = base
+
+    class MissingModelLLM:
+        async def stream_chat(self, messages, **kwargs):
+            raise LLMError(
+                "Model 'qwen3.5:9b' is not installed. Run: ollama pull qwen3.5:9b",
+                kind="model_missing",
+            )
+
+    agent = MoodleAgent(
+        settings=settings, db=db, browser=None, registry=registry, llm=MissingModelLLM()
+    )
+    events: list = []
+    outcome = _run(
+        agent,
+        AgentRun(conversation_id=conversation_id, user_message="Look at this."),
+        events,
+    )
+
+    assert outcome.error and "qwen3.5:9b" in outcome.error
+    errors = [event for event in events if event[0] == "error"]
+    assert len(errors) == 1, "the error must not be emitted twice"
+    assert not any(kind == "done" for kind, _msg, _data in events)
+    # The failed turn is not stored as an assistant reply.
+    assert [row["role"] for row in db.get_messages(conversation_id)] == ["user"]
+
 
 
 def test_draft_mode_nudges_a_model_that_stops_before_creating_files(base) -> None:
