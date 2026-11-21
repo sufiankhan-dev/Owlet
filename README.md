@@ -348,13 +348,3 @@ Issues and pull requests are welcome. Before you start, read
 [AGENTS.md](AGENTS.md), run `python -m pytest tests -q`, and keep the safety
 rules intact: **local only, read-only Moodle, no passwords, nothing runs
 automatically.**
-
-## Disclaimer
-
-Owlet is not affiliated with Moodle. You are responsible for following your
-institution's academic-integrity rules and Moodle terms of use. Owlet never
-submits work on your behalf.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
