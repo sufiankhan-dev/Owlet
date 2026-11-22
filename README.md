@@ -7,8 +7,9 @@ collects your courses, assignments, deadlines, and the teacher's files, and puts
 everything into neat folders. Then you can chat with a local AI to explain an
 assignment, plan your work, or draft a first version of the deliverables.
 
-- **Private.** The AI runs on your machine through [Ollama](https://ollama.com/).
-  No cloud AI, no API keys, no accounts, no data sent anywhere.
+- **Private.** The AI runs through [Ollama](https://ollama.com/) — on your
+  machine, or on a friend's machine over your own Tailscale network if you opt
+  in. No cloud AI, no API keys, no accounts, no data sent to a third party.
 - **Transparent.** Chrome stays visible, so you see every page Owlet opens.
 - **Read-only.** Owlet never submits, uploads, deletes, or changes anything on
   Moodle. You stay in control.
@@ -190,7 +191,8 @@ Everything works without a `.env` file. To change settings, copy
 | --- | --- | --- |
 | `APP_HOST` | `127.0.0.1` | Must be loopback; anything else is refused |
 | `APP_PORT` | `8765` | One process serves the API and the dashboard |
-| `OLLAMA_HOST` | `http://localhost:11434` | Must be local |
+| `OLLAMA_HOST` | `http://localhost:11434` | This machine, or a Tailscale peer with `OLLAMA_ALLOW_REMOTE` |
+| `OLLAMA_ALLOW_REMOTE` | `false` | Opt in to a Tailscale host (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`) |
 | `OLLAMA_MODEL` | `qwen3.5:9b` | Other local models work; the app is tuned for this model |
 | `OLLAMA_NUM_CTX` | `16384` | Context window |
 | `OLLAMA_TEMPERATURE` | `0.2` | Lower is more predictable |
@@ -216,6 +218,27 @@ Everything works without a `.env` file. To change settings, copy
 `https://moodle.example.edu/course/view.php?id=123`. A course is matched by host
 and course id, so the same id on another Moodle is not hidden.
 
+**Using a friend's Ollama over Tailscale.** By default the model must run on this
+machine; any other `OLLAMA_HOST` is refused at startup. To use a daemon on a
+Tailscale peer, set both values in `.env`:
+
+```dotenv
+OLLAMA_HOST=http://100.101.102.103:11434
+OLLAMA_ALLOW_REMOTE=true
+```
+
+Only Tailscale addresses are admitted, even with the flag on: `100.64.0.0/10`,
+the IPv6 range `fd7a:115c:a1e0::/48`, and MagicDNS names ending in `.ts.net`.
+Public IPs, cloud hosts, and ordinary LAN addresses such as `192.168.x.x` stay
+refused. On the peer, Ollama must listen beyond loopback
+(`OLLAMA_HOST=0.0.0.0:11434` in its own environment) and its firewall must allow
+port 11434 from the tailnet. There is no authentication on that port, so keep the
+tailnet private.
+
+Chat text, Moodle page text, attachments, and generated prompts are sent to the
+peer while this is on, and the dashboard labels the model as `remote` instead of
+`local`. Switch back by removing the flag or restoring a loopback host.
+
 </details>
 
 <details>
@@ -230,7 +253,7 @@ Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
    FastAPI + SSE  <---- events/approvals ----  Agent loop (validated tool calls)
         |                                                  |
         v                                                  v
-   Dashboard (127.0.0.1:8765)                    Ollama qwen3.5:9b (localhost)
+   Dashboard (127.0.0.1:8765)          Ollama qwen3.5:9b (localhost or Tailscale)
         |
         +--> SQLite (courses, assignments, conversations, activity, approvals)
         +--> database/chat_images/ (attached chat images)
@@ -342,7 +365,7 @@ Draft routes: `GET /api/assignments/{id}/draft`,
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite (no browser, no model): 154 passed, 10 skipped
+# Fast suite (no browser, no model): 172 passed, 10 skipped
 python -m pytest tests -q
 
 # Also run the real-Chrome tests (opens a browser window)
@@ -356,7 +379,8 @@ The browser suite includes a full mock-Moodle workflow: sync, PDF download and
 read, Word/PDF/code generation, and overwrite denial.
 
 Contributors: please read [AGENTS.md](AGENTS.md) first. It lists the rules every
-change must keep (loopback only, local model only, read-only Moodle, and so on).
+change must keep (loopback only, local model unless a Tailscale peer is opted
+into, read-only Moodle, and so on).
 
 </details>
 
@@ -366,7 +390,7 @@ change must keep (loopback only, local model only, read-only Moodle, and so on).
 
 Issues and pull requests are welcome. Before you start, read
 [AGENTS.md](AGENTS.md), run `python -m pytest tests -q`, and keep the safety
-rules intact: **local only, read-only Moodle, no passwords, nothing runs
+rules intact: **no cloud AI, read-only Moodle, no passwords, nothing runs
 automatically.**
 
 ## Disclaimer

@@ -1,6 +1,7 @@
-"""Thin, typed wrapper around the local Ollama daemon.
+"""Thin, typed wrapper around the Ollama daemon.
 
-Only the local endpoint from settings is used. Errors are translated into
+The endpoint comes from settings: this machine by default, or a Tailscale peer
+when the owner opted in with ``OLLAMA_ALLOW_REMOTE``. Errors are translated into
 ``LLMError`` so the API and agent loop can show actionable messages instead of
 raw tracebacks.
 """
@@ -130,7 +131,7 @@ def _normalize_tool_calls(raw_calls: Sequence[Any]) -> list[ToolCallRequest]:
 
 
 class OllamaService:
-    """Async client for the configured local model."""
+    """Async client for the configured Ollama daemon."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -138,6 +139,17 @@ class OllamaService:
             host=settings.ollama_host,
             timeout=httpx.Timeout(settings.ollama_timeout_s, connect=10.0),
         )
+
+    def _unreachable_hint(self) -> str:
+        """Recovery text that matches where the daemon is supposed to run."""
+
+        if self.settings.ollama_is_remote:
+            return (
+                "Check that Ollama is running on the Tailscale peer and that "
+                "it accepts connections on port 11434."
+            )
+        return "Is the Ollama app running?"
+
     # ---------- health ----------
 
     async def list_models(self) -> list[dict[str, Any]]:
@@ -147,7 +159,8 @@ class OllamaService:
             raise LLMError(f"Ollama rejected the request: {exc.error}", kind="daemon") from exc
         except (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError, OSError) as exc:
             raise LLMError(
-                f"Cannot reach Ollama at {self.settings.ollama_host}. Is the Ollama app running?",
+                f"Cannot reach Ollama at {self.settings.ollama_host}. "
+                f"{self._unreachable_hint()}",
                 kind="connection",
             ) from exc
         except httpx.TimeoutException as exc:
@@ -174,6 +187,7 @@ class OllamaService:
                 "ok": False,
                 "reachable": False,
                 "host": self.settings.ollama_host,
+                "remote": self.settings.ollama_is_remote,
                 "model": self.settings.ollama_model,
                 "installed": False,
                 "models": [],
@@ -203,6 +217,7 @@ class OllamaService:
             "ok": installed,
             "reachable": True,
             "host": self.settings.ollama_host,
+            "remote": self.settings.ollama_is_remote,
             "model": self.settings.ollama_model,
             "installed": installed,
             "models": models,
@@ -349,7 +364,7 @@ class OllamaService:
         except (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError, OSError) as exc:
             raise LLMError(
                 f"Lost connection to Ollama at {self.settings.ollama_host}. "
-                "Check that the Ollama app is still running.",
+                f"{self._unreachable_hint()}",
                 kind="connection",
             ) from exc
         except httpx.TimeoutException as exc:

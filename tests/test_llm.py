@@ -108,3 +108,20 @@ def test_health_is_offline_when_the_daemon_cannot_be_reached(tmp_path) -> None:
     assert health["installed"] is False
     assert health["error_kind"] == "connection"
     assert health["error"] == "Cannot reach Ollama."
+
+
+def test_health_says_whether_the_model_runs_here_or_on_a_peer(tmp_path) -> None:
+    local = _service(tmp_path, "qwen3.5:9b")
+    local._client = _StubClient([{"name": "qwen3.5:9b"}])
+
+    remote = OllamaService(
+        replace(
+            local.settings,
+            ollama_host="http://100.88.56.96:11434",
+            ollama_allow_remote=True,
+        )
+    )
+    remote._client = _StubClient([{"name": "qwen3.5:9b"}])
+
+    assert asyncio.run(local.health())["remote"] is False
+    assert asyncio.run(remote.health())["remote"] is True

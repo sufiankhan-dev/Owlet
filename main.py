@@ -22,7 +22,12 @@ def main() -> None:
     settings = load_settings()
     configure_logging(settings.log_level, settings.logs_dir)
     logger.info("Starting Owlet on http://%s:%s", settings.app_host, settings.app_port)
-    logger.info("Model: %s via %s", settings.ollama_model, settings.ollama_host)
+    logger.info(
+        "Model: %s via %s (%s)",
+        settings.ollama_model,
+        settings.ollama_host,
+        "Tailscale peer" if settings.ollama_is_remote else "local",
+    )
     uvicorn.run(
         "app.api:app",
         host=settings.app_host,

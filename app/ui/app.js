@@ -1263,7 +1263,7 @@
       draft.type = "button";
       draft.className = "btn btn-ghost small row-action";
       draft.textContent = "Draft";
-      draft.title = "Draft this assignment with the local model, then review it";
+      draft.title = "Draft this assignment with the configured model, then review it";
       draft.addEventListener("click", () => openDraft(assignment.id));
       row.appendChild(draft);
     }
@@ -1767,9 +1767,9 @@
     if (ollama.thinking) caps.push("thinking");
     setText(
       els.modelMeta,
-      `${model} · local${ollama.reachable === false ? " · offline" : ""}${
-        caps.length ? ` · ${caps.join(" + ")}` : ""
-      }`
+      `${model} · ${ollama.remote ? "remote" : "local"}${
+        ollama.reachable === false ? " · offline" : ""
+      }${caps.length ? ` · ${caps.join(" + ")}` : ""}`
     );
     updateModelNotice(ollama);
   }
@@ -1781,7 +1781,10 @@
       setText(els.modelNoticeTitle, "Ollama is not running");
       setText(
         els.modelNoticeBody,
-        ollama.error || "Start the Ollama app, then reload this page. Nothing leaves your laptop."
+        ollama.error ||
+          (ollama.remote
+            ? "Check that Ollama is running on the Tailscale peer, then reload this page."
+            : "Start the Ollama app, then reload this page. Nothing leaves your laptop.")
       );
       setText(els.modelNoticeCommand, "ollama serve");
       return;
@@ -1791,7 +1794,9 @@
       setText(els.modelNoticeTitle, `${ollama.model} is not installed`);
       setText(
         els.modelNoticeBody,
-        "Pull the model once in a terminal. It is a large download, but it only happens once."
+        ollama.remote
+          ? "Pull the model once on the Tailscale peer. It is a large download, but it only happens once."
+          : "Pull the model once in a terminal. It is a large download, but it only happens once."
       );
       setText(els.modelNoticeCommand, `ollama pull ${ollama.model}`);
       return;

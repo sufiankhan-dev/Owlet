@@ -4,8 +4,9 @@ This file is the contract for every change made in this repository, by a human o
 an AI agent. Read it at the start of a session. If a request conflicts with a rule
 here, say so and ask before proceeding.
 
-**Stack:** Python 3.11+ (verified 3.14.3) · FastAPI · Playwright · local Ollama
-(`qwen3.5:9b`) · SQLite. Dashboard is vanilla HTML/CSS/JS served by FastAPI: no
+**Stack:** Python 3.11+ (verified 3.14.3) · FastAPI · Playwright · Ollama
+(`qwen3.5:9b`; local by default, Tailscale peer only by opt-in) · SQLite.
+Dashboard is vanilla HTML/CSS/JS served by FastAPI: no
 Node, no build step (§6). **No cloud AI, no API keys, ever.**
 
 ---
@@ -18,7 +19,7 @@ from the owner — and even then, stop and confirm.
 | Invariant | Enforced in | Means |
 | --- | --- | --- |
 | **Loopback only** | `app/config.py` (`load_settings`), `app/api.py` (`local_only`) | `APP_HOST` stays `127.0.0.1`/`localhost`/`::1`. Host and `Origin` headers are checked on every request. |
-| **Local model only** | `app/config.py` | `OLLAMA_HOST` must resolve to loopback. No cloud inference, ever. |
+| **Local model by default** | `app/config.py` (`load_settings`) | `OLLAMA_HOST` must resolve to loopback unless `OLLAMA_ALLOW_REMOTE=true`, which admits only Tailscale peers (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). Public, cloud, and LAN endpoints stay refused. |
 | **No password handling** | `browser/session.py`, `app/ui/` | Moodle *account* login is manual in visible Chrome; the app never asks for, reads, types, logs, or stores it. The single exception is the optional **network** (HTTP Basic auth) pair in the collapsed "Network login" panel: it goes straight to Playwright's context at launch, lives in memory only, is cleared on disconnect, and is never logged, stored, or put in the database. |
 | **Read-only Moodle** | `app/security.py`, `browser/moodle.py`, `tools/` | No submit, upload, delete, grade, profile, or enrolment actions. Dangerous paths stay blocked even if the model asks. |
 | **Path jail** | `app/security.py` (`PathJail`), `tools/` | All writes resolve under `workspace/` or `generated/`. Reject traversal, absolute paths, symlinks. |
@@ -132,7 +133,8 @@ dashboard is plain CSS/JS with no type-checking or build step.
 - Deleting files or directories, or running anything destructive.
 - Touching `workspace/`, `generated/`, `browser/profile/`, `database/*.db*`,
   `config/app_state.json`, `.env`, or `logs/` — these are user data.
-- Any network call beyond the local Ollama and the user's Moodle host.
+- Any network call beyond the local Ollama (or an opted-in Tailscale peer) and
+  the user's Moodle host.
 
 **Never do**
 

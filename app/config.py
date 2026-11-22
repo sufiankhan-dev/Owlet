@@ -6,6 +6,7 @@ No secret is ever stored here: the Moodle password never enters the process.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # The one place the default model is named. Override it with OLLAMA_MODEL.
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 load_dotenv(PROJECT_ROOT / ".env")
+
+# Hostnames that mean "the machine this app runs on".
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Tailscale hands out addresses from these ranges, so a peer can be recognised
+# from the literal address without trusting DNS. Anything else is off-limits.
+TAILSCALE_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+)
+
+
+def is_tailscale_host(host: str) -> bool:
+    """True for a Tailscale CGNAT/ULA address or a MagicDNS ``*.ts.net`` name."""
+
+    name = host.strip().strip("[]").lower()
+    if name.endswith(".ts.net"):
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return any(address in network for network in TAILSCALE_NETWORKS)
 
 
 def _env_str(name: str, default: str) -> str:
@@ -91,6 +115,8 @@ class Settings:
     log_level: str
 
     ollama_host: str
+    # True when the owner opted into a Tailscale peer via OLLAMA_ALLOW_REMOTE.
+    ollama_allow_remote: bool
     ollama_model: str
     ollama_num_ctx: int
     ollama_temperature: float
@@ -171,6 +197,12 @@ class Settings:
         return self.max_image_mb * 1024 * 1024
 
     @property
+    def ollama_is_remote(self) -> bool:
+        """True when the model runs on a Tailscale peer instead of this machine."""
+
+        return (urlparse(self.ollama_host).hostname or "") not in LOOPBACK_HOSTS
+
+    @property
     def moodle_host(self) -> str | None:
         if not self.moodle_url:
             return None
@@ -201,14 +233,24 @@ def load_settings() -> Settings:
         )
 
     ollama_host = _env_str("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    ollama_allow_remote = _env_bool("OLLAMA_ALLOW_REMOTE", False)
     parsed = urlparse(ollama_host)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError(f"OLLAMA_HOST is not a valid http(s) URL: {ollama_host!r}")
-    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        raise ValueError(
-            "OLLAMA_HOST must point at the local Ollama daemon. "
-            "Remote/cloud inference is deliberately unsupported."
-        )
+    if parsed.hostname not in LOOPBACK_HOSTS:
+        if not ollama_allow_remote:
+            raise ValueError(
+                f"OLLAMA_HOST points at {parsed.hostname!r}, which is not this machine. "
+                "Set OLLAMA_ALLOW_REMOTE=true to use a Tailscale peer "
+                "(100.64.0.0/10 or *.ts.net). Cloud inference is unsupported."
+            )
+        if not is_tailscale_host(parsed.hostname):
+            raise ValueError(
+                f"OLLAMA_HOST {parsed.hostname!r} is not a Tailscale address. "
+                "OLLAMA_ALLOW_REMOTE=true admits only 100.64.0.0/10, "
+                "fd7a:115c:a1e0::/48, and *.ts.net hosts; "
+                "public and LAN endpoints stay refused."
+            )
 
     moodle_url = _env_str("MOODLE_URL", "") or None
     if moodle_url:
@@ -238,6 +280,7 @@ def load_settings() -> Settings:
         app_port=_env_int("APP_PORT", 8765, 1024, 65535),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         ollama_host=ollama_host,
+        ollama_allow_remote=ollama_allow_remote,
         ollama_model=_env_str("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         ollama_num_ctx=_env_int("OLLAMA_NUM_CTX", 16384, 2048, 65536),
         ollama_temperature=_env_float("OLLAMA_TEMPERATURE", 0.2, 0.0, 2.0),
