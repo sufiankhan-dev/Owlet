@@ -218,7 +218,11 @@ class AppState:
         self.emit(
             "user_message",
             content,
-            {"conversation_id": cid, "images": with_urls(cid, saved)},
+            {
+                "conversation_id": cid,
+                "images": with_urls(cid, saved),
+                "message_id": f"{self.active_run_id}:user",
+            },
         )
         self._task = asyncio.create_task(self._run_agent(run))
         return cid, self.active_run_id
@@ -392,7 +396,11 @@ class AppState:
         self.emit(
             "user_message",
             message,
-            {"conversation_id": cid, "draft_assignment_id": assignment_id},
+            {
+                "conversation_id": cid,
+                "draft_assignment_id": assignment_id,
+                "message_id": f"{self.active_run_id}:user",
+            },
         )
         self.emit(
             "draft",

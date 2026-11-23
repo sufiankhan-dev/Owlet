@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -52,6 +53,9 @@ class AgentOutcome:
     steps: int = 0
     tool_calls: int = 0
     model: str = ""
+    # Stable id of the last assistant message this run streamed. The dashboard
+    # uses it to finalise exactly one bubble instead of appending a second copy.
+    message_id: str = ""
 
 
 @dataclass
@@ -162,11 +166,21 @@ class MoodleAgent:
             outcome.steps = step
             ctx.log("agent", f"Model round {step}", {"model": self.settings.ollama_model})
 
+            # One stable id per model round. Every delta and the final message
+            # event carry it, so the dashboard can stream into exactly one
+            # bubble and never append the same answer a second time.
+            message_id = uuid.uuid4().hex[:12]
+            outcome.message_id = message_id
+
             try:
                 result = await self.llm.stream_chat(
                     messages,
                     tools=self.registry.schemas(),
-                    on_delta=lambda delta: emit("assistant_delta", delta, None),
+                    on_delta=lambda delta, mid=message_id, round_no=step: emit(
+                        "assistant_delta",
+                        delta,
+                        {"message_id": mid, "step": round_no},
+                    ),
                     should_stop=lambda: run.stop_requested,
                 )
             except LLMError as exc:
@@ -184,7 +198,15 @@ class MoodleAgent:
                 return await self._finish(run, outcome, emit, "Stopped by user")
 
             if result.content:
-                emit("assistant_message", result.content, None)
+                emit(
+                    "assistant_message",
+                    result.content,
+                    {
+                        "message_id": message_id,
+                        "step": step,
+                        "final": not result.tool_calls,
+                    },
+                )
 
             if (
                 not result.tool_calls
@@ -358,9 +380,13 @@ class MoodleAgent:
             except Exception:
                 logger.exception("Could not save assistant message")
         if outcome.cancelled:
-            emit("stopped", "Agent stopped", {"steps": outcome.steps})
+            emit(
+                "stopped",
+                "Agent stopped",
+                {"steps": outcome.steps, "message_id": outcome.message_id},
+            )
         elif outcome.error:
-            emit("error", outcome.error, None)
+            emit("error", outcome.error, {"message_id": outcome.message_id})
         else:
             emit(
                 "done",
@@ -369,6 +395,7 @@ class MoodleAgent:
                     "steps": outcome.steps,
                     "tool_calls": outcome.tool_calls,
                     "model": outcome.model,
+                    "message_id": outcome.message_id,
                 },
             )
         return outcome

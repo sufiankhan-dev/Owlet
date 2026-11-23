@@ -120,9 +120,11 @@
     conversationId: null,
     conversations: [],
     running: false,
+    sending: false,
     conversationStarted: false,
-    streamingEl: null,
-    streamingText: "",
+    // The assistant message currently being streamed:
+    // { id, msg, bubble, body, text, frame, done }.
+    stream: null,
     waitingEl: null,
     lastAssistantEl: null,
     lastUserMessageEl: null,
@@ -367,8 +369,15 @@
       return `\u0000${codes.length - 1}\u0000`;
     });
 
+    // Models sometimes emit escaped markers (\*\*bold\*\*) or names with
+    // underscores. Unescape the punctuation so the intent renders instead of
+    // showing literal backslashes.
+    out = out.replace(/\\([\\`*_{}\[\]()#+\-.!>~|])/g, "$1");
+
     out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
     out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    out = out.replace(/(^|[^\w_])_([^_\n]+)_(?![\w_])/g, "$1<em>$2</em>");
     out = out.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
 
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
@@ -428,19 +437,152 @@
     return `<pre><code${cls}>${highlightCode(raw)}</code></pre>`;
   }
 
+  // A compact block parser. It is deliberately dependency-free and runs
+  // safely on partial text, so an unfinished response can be rendered on every
+  // animation frame without waiting for the closing markers.
+  const LIST_ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+  const TABLE_SEPARATOR = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+
+  function tableCells(line) {
+    let text = String(line || "").trim();
+    if (text.startsWith("|")) text = text.slice(1);
+    if (text.endsWith("|")) text = text.slice(0, -1);
+    const cells = [];
+    let current = "";
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+      if (char === "\\" && text[i + 1] === "|") {
+        current += "|";
+        i += 1;
+        continue;
+      }
+      if (char === "|") {
+        cells.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    cells.push(current.trim());
+    return cells;
+  }
+
+  function tableAlignment(cell) {
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return "";
+  }
+
+  function renderTable(lines, start) {
+    const header = tableCells(lines[start]);
+    const alignments = tableCells(lines[start + 1]).map(tableAlignment);
+    let i = start + 2;
+    const rows = [];
+    while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+      rows.push(tableCells(lines[i]));
+      i += 1;
+    }
+
+    const alignClass = (index) =>
+      alignments[index] ? ` class="ta-${alignments[index]}"` : "";
+    const head = header
+      .map((cell, index) => `<th${alignClass(index)}>${inlineMarkdown(cell)}</th>`)
+      .join("");
+    const body = rows
+      .map(
+        (row) =>
+          `<tr>${header
+            .map(
+              (_cell, index) =>
+                `<td${alignClass(index)}>${inlineMarkdown(row[index] || "")}</td>`
+            )
+            .join("")}</tr>`
+      )
+      .join("");
+
+    return {
+      html: `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`,
+      next: i,
+    };
+  }
+
+  function renderListBlock(lines, start) {
+    const items = [];
+    let i = start;
+    let previous = null;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const match = line.match(LIST_ITEM);
+      if (match) {
+        const indent = match[1].replace(/\t/g, "  ").length;
+        previous = {
+          indent,
+          ordered: /^\d/.test(match[2]),
+          text: match[3].trim(),
+        };
+        items.push(previous);
+        i += 1;
+        continue;
+      }
+      if (!line.trim()) break;
+      // Indented continuation text belongs to the item above it.
+      if (
+        previous &&
+        /^\s{2,}/.test(line) &&
+        !/^\s*(```+|~~~+|>|#{1,6}\s)/.test(line) &&
+        !TABLE_SEPARATOR.test(line)
+      ) {
+        previous.text += ` ${line.trim()}`;
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    function build(from, indent) {
+      if (from >= items.length) return { html: "", next: from };
+      const type = items[from].ordered ? "ol" : "ul";
+      let out = `<${type}>`;
+      let cursor = from;
+
+      while (cursor < items.length && items[cursor].indent === indent) {
+        if ((items[cursor].ordered ? "ol" : "ul") !== type) break;
+        out += `<li>${inlineMarkdown(items[cursor].text)}`;
+        cursor += 1;
+        while (cursor < items.length && items[cursor].indent > indent) {
+          const child = build(cursor, items[cursor].indent);
+          if (!child.html || child.next <= cursor) break;
+          out += child.html;
+          cursor = child.next;
+        }
+        out += "</li>";
+      }
+
+      out += `</${type}>`;
+      return { html: out, next: cursor };
+    }
+
+    let html = "";
+    let cursor = 0;
+    while (cursor < items.length) {
+      const part = build(cursor, items[cursor].indent);
+      if (!part.html || part.next <= cursor) break;
+      html += part.html;
+      cursor = part.next;
+    }
+    return { html, next: i };
+  }
+
   function renderMarkdown(source) {
     const normalized = String(source ?? "").replace(/\r\n?/g, "\n");
     const rawLines = normalized.split("\n");
-    const escaped = escapeHtml(normalized);
-    const lines = escaped.split("\n");
+    const lines = escapeHtml(normalized).split("\n");
     const html = [];
-
     let paragraph = [];
-    let listType = null;
-    let listItems = [];
-    let inCode = false;
-    let codeLang = "";
-    let codeLines = [];
 
     function flushParagraph() {
       if (!paragraph.length) return;
@@ -448,91 +590,82 @@
       paragraph = [];
     }
 
-    function flushList() {
-      if (!listType) return;
-      html.push(`<${listType}>${listItems.join("")}</${listType}>`);
-      listType = null;
-      listItems = [];
-    }
-
-    function flushAll() {
-      flushParagraph();
-      flushList();
-    }
-
-    for (let i = 0; i < lines.length; i += 1) {
+    let i = 0;
+    while (i < lines.length) {
       const line = lines[i];
 
-      if (/^\s*```/.test(line)) {
-        if (!inCode) {
-          flushAll();
-          inCode = true;
-          codeLang = line.trim().replace(/^```/, "").trim().replace(/[^a-zA-Z0-9+#.-]/g, "");
-          codeLines = [];
-        } else {
-          html.push(renderCodeBlock(codeLines.join("\n"), codeLang));
-          inCode = false;
-          codeLang = "";
+      const fence = line.match(/^\s*(`{3,}|~{3,})\s*(.*)$/);
+      if (fence) {
+        flushParagraph();
+        const marker = fence[1][0];
+        const lang = fence[2].trim().replace(/[^a-zA-Z0-9+#.-]/g, "");
+        const closeFence = marker === "`" ? /^\s*`{3,}\s*$/ : /^\s*~{3,}\s*$/;
+        const codeLines = [];
+        i += 1;
+        while (i < lines.length && !closeFence.test(lines[i])) {
+          codeLines.push(rawLines[i]);
+          i += 1;
         }
-        continue;
-      }
-
-      if (inCode) {
-        codeLines.push(rawLines[i]);
+        i += 1; // consume the closing fence (or the end of the text)
+        html.push(renderCodeBlock(codeLines.join("\n"), lang));
         continue;
       }
 
       if (!line.trim()) {
-        flushAll();
+        flushParagraph();
+        i += 1;
         continue;
       }
 
       const heading = line.match(/^(#{1,6})\s+(.*)$/);
       if (heading) {
-        flushAll();
-        const level = heading[1].length === 1 ? "h3" : heading[1].length === 2 ? "h4" : "h5";
+        flushParagraph();
+        const level =
+          heading[1].length === 1 ? "h3" : heading[1].length === 2 ? "h4" : "h5";
         html.push(`<${level}>${inlineMarkdown(heading[2].trim())}</${level}>`);
+        i += 1;
         continue;
       }
 
       if (/^\s*([-*_])\s*(?:\1\s*){2,}$/.test(line)) {
-        flushAll();
+        flushParagraph();
         html.push("<hr>");
+        i += 1;
         continue;
       }
 
-      if (/^>\s?/.test(line)) {
-        flushAll();
+      if (rawLines[i] && /^>\s?/.test(rawLines[i])) {
+        flushParagraph();
         const quote = [];
-        while (i < lines.length && /^>\s?/.test(lines[i])) {
-          quote.push(lines[i].replace(/^>\s?/, ""));
+        while (i < rawLines.length && /^>\s?/.test(rawLines[i])) {
+          quote.push(rawLines[i].replace(/^>\s?/, ""));
           i += 1;
         }
-        i -= 1;
-        html.push(`<blockquote>${inlineMarkdown(quote.join(" "))}</blockquote>`);
+        html.push(`<blockquote>${renderMarkdown(quote.join("\n"))}</blockquote>`);
         continue;
       }
 
-      const unordered = line.match(/^\s*[-*+]\s+(.*)$/);
-      const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-
-      if (unordered || ordered) {
+      if (line.includes("|") && i + 1 < lines.length && TABLE_SEPARATOR.test(lines[i + 1])) {
         flushParagraph();
-        const type = unordered ? "ul" : "ol";
-        if (listType && listType !== type) flushList();
-        listType = type;
-        listItems.push(`<li>${inlineMarkdown((unordered || ordered)[1])}</li>`);
+        const table = renderTable(lines, i);
+        html.push(table.html);
+        i = table.next;
         continue;
       }
 
-      flushList();
+      if (LIST_ITEM.test(line)) {
+        flushParagraph();
+        const list = renderListBlock(lines, i);
+        html.push(list.html);
+        i = list.next;
+        continue;
+      }
+
       paragraph.push(line.trim());
+      i += 1;
     }
 
-    if (inCode && codeLines.length) {
-      html.push(renderCodeBlock(codeLines.join("\n"), codeLang));
-    }
-    flushAll();
+    flushParagraph();
     return html.join("");
   }
 
@@ -568,6 +701,7 @@
 
   function restoreWelcome() {
     if (!els.messages) return;
+    resetStream();
     els.messages.innerHTML = welcomeMarkup;
     els.messages.scrollTop = 0;
     state.lastUserMessageEl = null;
@@ -622,22 +756,27 @@
       row.className = "msg-actions";
       main.appendChild(row);
     }
-    if (options.copy) {
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.className = "msg-action";
-      copy.dataset.act = "copy";
-      copy.textContent = "Copy";
-      row.appendChild(copy);
-    }
+
+    // Idempotent: a repeated final event must not grow a second Copy button on
+    // a message that already has one.
+    const addAction = (act, label, title) => {
+      if (row.querySelector(`.msg-action[data-act="${act}"]`)) return;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "msg-action";
+      button.dataset.act = act;
+      button.textContent = label;
+      if (title) button.title = title;
+      row.appendChild(button);
+    };
+
+    if (options.copy) addAction("copy", "Copy");
     if (options.regenerate) {
-      const again = document.createElement("button");
-      again.type = "button";
-      again.className = "msg-action";
-      again.dataset.act = "regenerate";
-      again.textContent = "Regenerate";
-      again.title = "Ask the model to answer the last question again";
-      row.appendChild(again);
+      addAction(
+        "regenerate",
+        "Regenerate",
+        "Ask the model to answer the last question again"
+      );
     }
     row.classList.toggle("hidden", !row.children.length);
     return row;
@@ -671,9 +810,103 @@
     return meta;
   }
 
+  let messageSeq = 0;
+
+  function newMessageId() {
+    messageSeq += 1;
+    return `m-${Date.now().toString(36)}-${messageSeq}`;
+  }
+
+  function messageById(id) {
+    if (!id || !els.messages) return null;
+    return (
+      Array.from(els.messages.querySelectorAll(".msg[data-message-id]")).find(
+        (msg) => msg.dataset.messageId === id
+      ) || null
+    );
+  }
+
+  // Every assistant bubble owns exactly one body element. Streaming re-renders
+  // that same element; it must never append a second copy of the answer.
+  function ensureBubbleBody(bubble) {
+    if (!bubble) return null;
+    let body = bubble.querySelector(".bubble-text");
+    if (!body) {
+      body = document.createElement("div");
+      body.className = "bubble-text";
+    }
+    Array.from(bubble.childNodes).forEach((node) => {
+      if (node === body) return;
+      // A bare text node is what the old streaming path left behind next to the
+      // rendered body, which displayed every answer twice.
+      if (node.nodeType === Node.TEXT_NODE) node.remove();
+    });
+    bubble.querySelectorAll(".bubble-text").forEach((candidate) => {
+      if (candidate !== body) candidate.remove();
+    });
+    if (!body.parentNode) bubble.appendChild(body);
+    return body;
+  }
+
+  function setAssistantBody(msg, text) {
+    if (!msg) return null;
+    const bubble = msg.querySelector(".bubble");
+    if (!bubble) return null;
+    bubble.classList.remove("streaming");
+    const body = ensureBubbleBody(bubble);
+    body.innerHTML = renderMarkdown(text);
+    msg.dataset.rawText = String(text ?? "");
+    state.lastAssistantEl = msg;
+    ensureMessageMeta(msg, new Date().toISOString());
+    clearRegenerateActions();
+    messageActions(msg, { copy: true, regenerate: true });
+    return body;
+  }
+
+  // True only while the same turn is still on screen: a newer user message
+  // means a new question, so an identical answer is legitimate there.
+  function duplicatedAssistant(text, exclude) {
+    let last = state.lastAssistantEl;
+    if (last === exclude) {
+      let node = last?.previousElementSibling || null;
+      last = null;
+      while (node) {
+        if (node.classList?.contains("msg")) {
+          if (node.classList.contains("user")) return null;
+          if (node.classList.contains("assistant")) {
+            last = node;
+            break;
+          }
+        }
+        node = node.previousElementSibling;
+      }
+    }
+    if (!last || !els.messages?.contains(last)) return null;
+    let node = last.nextElementSibling;
+    while (node) {
+      if (node.classList?.contains("msg") && node.classList.contains("user")) return null;
+      node = node.nextElementSibling;
+    }
+    return last.dataset.rawText === String(text) ? last : null;
+  }
+
+  function resetStream() {
+    const stream = state.stream;
+    if (stream) {
+      if (stream.frame) window.cancelAnimationFrame(stream.frame);
+      stream.frame = 0;
+      stream.done = true;
+    }
+    state.stream = null;
+  }
+
   function createMessage(role, text, options = {}) {
     const msg = document.createElement("div");
     msg.className = `msg ${role}`;
+    msg.dataset.messageId = options.messageId || newMessageId();
+    if (role === "assistant" && !options.error && !options.notice) {
+      msg.dataset.rawText = String(text ?? "");
+    }
 
     if (role === "assistant") {
       const avatar = document.createElement("div");
@@ -724,13 +957,14 @@
     return { msg, bubble };
   }
 
-  function appendUser(text, images, createdAt) {
+  function appendUser(text, images, createdAt, messageId) {
     removeWelcome();
     const shown = String(text ?? "");
     const { msg } = createMessage("user", shown, {
       plain: true,
       images,
       createdAt: createdAt || new Date().toISOString(),
+      messageId,
     });
     state.lastUserMessageEl = msg;
     state.lastUserText = shown;
@@ -815,48 +1049,127 @@
     }
   }
 
-  function ensureStreaming() {
+  function startStreaming(messageId) {
     hideWaiting();
-    if (state.streamingEl) return state.streamingEl;
     removeWelcome();
-    const { msg, bubble } = createMessage("assistant", "", { streaming: true });
-    state.streamingEl = bubble;
-    state.streamingText = "";
+    const { msg, bubble } = createMessage("assistant", "", {
+      streaming: true,
+      messageId: messageId || newMessageId(),
+    });
+    const body = ensureBubbleBody(bubble);
+    const stream = {
+      id: msg.dataset.messageId,
+      msg,
+      bubble,
+      body,
+      text: "",
+      frame: 0,
+      done: false,
+    };
+    state.stream = stream;
     state.lastAssistantEl = msg;
-    return bubble;
+    scrollToBottom(true);
+    return stream;
   }
 
-  function finalizeStreaming(finalText) {
-    hideWaiting();
-    const bubble = state.streamingEl;
-    const text =
-      finalText === undefined || finalText === null ? state.streamingText : String(finalText);
+  function scheduleStreamPreview(stream) {
+    if (!stream || stream.done || stream.frame) return;
+    stream.frame = window.requestAnimationFrame(() => {
+      stream.frame = 0;
+      if (!stream.done) stream.body.innerHTML = renderMarkdown(stream.text);
+    });
+  }
 
-    if (!bubble) {
-      state.streamingText = "";
-      if (text.trim()) return appendAssistant(text, { regenerate: true }).msg;
+  function appendAssistantDelta(chunk, messageId) {
+    const text = String(chunk ?? "");
+    if (!text) return;
+
+    let stream = state.stream;
+    if (stream && stream.done) stream = null;
+
+    if (!stream) {
+      // A replay of a message that already finished must not open a new bubble.
+      if (messageId && messageById(messageId)) return;
+      stream = startStreaming(messageId);
+    } else if (messageId && stream.id !== messageId) {
+      // A new model round began without a final event for the previous one.
+      finalizeStreaming(undefined, { messageId: stream.id });
+      stream = state.stream;
+      if (messageId && messageById(messageId)) return;
+      if (!stream) stream = startStreaming(messageId);
+    }
+
+    stream.text += text;
+    scheduleStreamPreview(stream);
+    scrollToBottom(false);
+  }
+
+  function upsertAssistantMessage(messageId, text, options = {}) {
+    const existing =
+      (messageId ? messageById(messageId) : null) || duplicatedAssistant(text);
+    if (existing) {
+      // A repeated final event (same id) or the same answer arriving again in
+      // one turn is an update, never a second message with the same content.
+      setAssistantBody(existing, text);
+      return existing;
+    }
+    removeWelcome();
+    const { msg } = appendAssistant(text, {
+      ...options,
+      messageId: messageId || newMessageId(),
+      regenerate: options.regenerate !== false,
+    });
+    return msg;
+  }
+
+  function finalizeStreaming(finalText, options = {}) {
+    hideWaiting();
+    const stream = state.stream;
+    const text =
+      finalText === undefined || finalText === null
+        ? stream
+          ? stream.text
+          : ""
+        : String(finalText);
+
+    if (!stream) {
+      // Nothing is streaming: an event without deltas still creates exactly one
+      // message, and a repeat updates that same message.
+      if (!text.trim()) return null;
+      return upsertAssistantMessage(options.messageId, text, options);
+    }
+
+    if (stream.frame) {
+      window.cancelAnimationFrame(stream.frame);
+      stream.frame = 0;
+    }
+    stream.done = true;
+    state.stream = null;
+
+    const msg = stream.msg;
+    const content = text.trim() ? text : stream.text;
+
+    if (!content.trim()) {
+      msg.remove();
+      if (state.lastAssistantEl === msg) state.lastAssistantEl = null;
+      scrollToBottom(false);
       return null;
     }
 
-    const msg = bubble.closest(".msg");
-    bubble.classList.remove("streaming");
-    if (text.trim()) {
-      bubble.querySelector(".bubble-text")?.remove();
-      const body = document.createElement("div");
-      body.className = "bubble-text";
-      body.innerHTML = renderMarkdown(text);
-      bubble.appendChild(body);
-      state.lastAssistantEl = msg;
-      ensureMessageMeta(msg, new Date().toISOString());
-      clearRegenerateActions();
-      messageActions(msg, { copy: true, regenerate: true });
-    } else if (msg) {
+    // If this round repeats the answer already on screen in the same turn,
+    // keep the existing bubble and drop the duplicate instead of showing it
+    // twice.
+    const duplicate = duplicatedAssistant(content, msg);
+    if (duplicate) {
       msg.remove();
-      if (state.lastAssistantEl === msg) state.lastAssistantEl = null;
+      state.lastAssistantEl = duplicate;
+      setAssistantBody(duplicate, content);
+      scrollToBottom(false);
+      return duplicate;
     }
 
-    state.streamingEl = null;
-    state.streamingText = "";
+    // Finalise the same element that streamed; no second body is ever added.
+    setAssistantBody(msg, content);
     scrollToBottom(false);
     return msg;
   }
@@ -2101,8 +2414,7 @@
     state.lastAssistantEl = null;
     state.lastUserMessageEl = null;
     state.lastUserText = "";
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
     hideWaiting();
 
@@ -2114,12 +2426,16 @@
     let shown = 0;
     rows.forEach((row) => {
       const content = String(row.content || "");
+      const messageId = row.id !== undefined && row.id !== null ? `db-${row.id}` : undefined;
       if (row.role === "user") {
-        appendUser(content, row.images || [], row.created_at);
+        appendUser(content, row.images || [], row.created_at, messageId);
         lastRole = "user";
         shown += 1;
       } else if (content.trim()) {
-        lastAssistant = appendAssistant(content, { createdAt: row.created_at }).msg;
+        lastAssistant = appendAssistant(content, {
+          createdAt: row.created_at,
+          messageId,
+        }).msg;
         lastRole = "assistant";
         shown += 1;
       }
@@ -2460,7 +2776,9 @@
     const typed = String(rawText ?? "").trim();
     const attachments = state.attachments.slice();
     if (!typed && !attachments.length) return;
-    if (state.running) {
+    // One submission, one generation request. `sending` closes the gap between
+    // the click/Enter handler firing and the POST actually being in flight.
+    if (state.running || state.sending) {
       showToast("The agent is already working. Stop it or wait for it to finish.");
       return;
     }
@@ -2481,6 +2799,7 @@
       name: attachment.name,
     }));
 
+    state.sending = true;
     appendUser(text, previews);
     clearAttachments();
     if (els.messageInput) {
@@ -2527,6 +2846,8 @@
         appendError(error.message);
       }
       setText(els.agentActivity, "Ready");
+    } finally {
+      state.sending = false;
     }
   }
 
@@ -2539,8 +2860,7 @@
       node = next;
     }
     state.lastAssistantEl = null;
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
     hideWaiting();
     updateScrollButton();
@@ -2637,8 +2957,7 @@
     state.lastAssistantEl = null;
     state.lastUserMessageEl = null;
     state.lastUserText = "";
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
     hideWaiting();
     clearAttachments();
@@ -2677,8 +2996,7 @@
     state.lastAssistantEl = null;
     state.lastUserMessageEl = null;
     state.lastUserText = "";
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
     state.approvals.clear();
     state.currentApprovalId = null;
@@ -2771,12 +3089,19 @@
           refreshConversations();
           break;
         }
+        const messageId = data?.message_id || null;
+        const shown = messageId ? messageById(messageId) : null;
         const alreadyShown =
-          state.lastUserText === message &&
-          state.lastUserMessageEl &&
-          els.messages?.contains(state.lastUserMessageEl);
+          Boolean(shown) ||
+          (state.lastUserText === message &&
+            state.lastUserMessageEl &&
+            els.messages?.contains(state.lastUserMessageEl));
         if (!alreadyShown) {
-          appendUser(message, data?.images || []);
+          appendUser(message, data?.images || [], undefined, messageId);
+        } else if (messageId && state.lastUserMessageEl) {
+          // The optimistic bubble was already drawn: adopt the server id so a
+          // replay of this event can never add it a second time.
+          state.lastUserMessageEl.dataset.messageId = messageId;
         }
         state.lastUserText = message;
         refreshConversations();
@@ -2819,16 +3144,22 @@
       }
 
       case "assistant_delta": {
-        if (!message) break;
-        const bubble = ensureStreaming();
-        state.streamingText += message;
-        bubble.textContent = state.streamingText;
-        scrollToBottom(false);
+        appendAssistantDelta(message, data?.message_id || null);
         break;
       }
 
       case "assistant_message": {
-        finalizeStreaming(message);
+        const messageId = data?.message_id || null;
+        const stream = state.stream;
+        if (stream && !stream.done && (!messageId || stream.id === messageId)) {
+          // The final event for the round that is already on screen: finalise
+          // that exact element. This is the end of the message, not a new one.
+          finalizeStreaming(message, { messageId: stream.id });
+          break;
+        }
+        if (stream) finalizeStreaming(undefined, { messageId: stream.id });
+        // No live stream (or a replayed event): update by id, or create once.
+        upsertAssistantMessage(messageId, message);
         break;
       }
 
@@ -2947,13 +3278,14 @@
       }
 
       case "done": {
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         setRunning(false);
         if (data) {
           const parts = [];
           if (data.steps) parts.push(plural(data.steps, "model round"));
           if (data.tool_calls) parts.push(plural(data.tool_calls, "tool call"));
-          addMessageMeta(state.lastAssistantEl, parts.join(" · "));
+          const target = (data.message_id && messageById(data.message_id)) || state.lastAssistantEl;
+          addMessageMeta(target, parts.join(" · "));
         }
         setText(els.agentActivity, "Ready");
         refreshConversations();
@@ -2962,7 +3294,7 @@
       }
 
       case "stopped": {
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         appendNotice("Stopped. You can ask a smaller next step.");
         setRunning(false);
         setText(els.agentActivity, "Stopped");
@@ -2996,7 +3328,7 @@
 
       case "error": {
         const wasRunning = state.running;
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         if (wasRunning) appendError(message || "Something went wrong.");
         else showToast(message || "Something went wrong.", "bad");
         setText(els.agentActivity, "Error — see the chat");

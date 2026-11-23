@@ -447,6 +447,47 @@ def test_chat_turn_completes_and_persists(api) -> None:
     assert state.agent_state()["running"] is False
 
 
+def test_chat_events_carry_stable_message_ids(api) -> None:
+    client, state, _settings = api
+    seen: list[tuple[str, str, dict | None]] = []
+    original = state.emit
+
+    def record(kind, message, data=None):
+        seen.append((kind, message, data))
+        original(kind, message, data)
+
+    state.emit = record  # type: ignore[method-assign]
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "Say hello"},
+            headers={"X-Owlet": "1"},
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not state.agent_state()["running"]:
+                break
+            time.sleep(0.05)
+    finally:
+        state.emit = original  # type: ignore[method-assign]
+
+    users = [data for kind, _msg, data in seen if kind == "user_message"]
+    assert len(users) == 1
+    assert users[0]["message_id"] == f"{run_id}:user"
+
+    deltas = [data for kind, _msg, data in seen if kind == "assistant_delta"]
+    finals = [data for kind, _msg, data in seen if kind == "assistant_message"]
+    done = [data for kind, _msg, data in seen if kind == "done"]
+    assert deltas and len(finals) == 1 and len(done) == 1
+    assert len({data["message_id"] for data in deltas}) == 1
+    streamed_id = deltas[0]["message_id"]
+    assert finals[0]["message_id"] == streamed_id
+    assert done[0]["message_id"] == streamed_id, "done must finalise the streamed bubble"
+
+
 # ---------- chat images, regenerate, conversation management ----------
 
 PNG = base64.b64decode(
