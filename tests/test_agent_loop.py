@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.llm import LLMResult, ToolCallRequest
+from agent.llm import LLMError, LLMResult, ToolCallRequest
 from agent.loop import AgentRun, MoodleAgent
 from app.config import load_settings
 from database.db import Database
@@ -218,6 +218,35 @@ def test_cancelled_result_is_not_saved_as_answer(base) -> None:
     assert outcome.content == ""
 
 
+def test_model_failure_emits_one_error_event(base) -> None:
+    settings, db, conversation_id, registry, _executed = base
+
+    class MissingModelLLM:
+        async def stream_chat(self, messages, **kwargs):
+            raise LLMError(
+                "Model 'qwen3.5:9b' is not installed. Run: ollama pull qwen3.5:9b",
+                kind="model_missing",
+            )
+
+    agent = MoodleAgent(
+        settings=settings, db=db, browser=None, registry=registry, llm=MissingModelLLM()
+    )
+    events: list = []
+    outcome = _run(
+        agent,
+        AgentRun(conversation_id=conversation_id, user_message="Look at this."),
+        events,
+    )
+
+    assert outcome.error and "qwen3.5:9b" in outcome.error
+    errors = [event for event in events if event[0] == "error"]
+    assert len(errors) == 1, "the error must not be emitted twice"
+    assert not any(kind == "done" for kind, _msg, _data in events)
+    # The failed turn is not stored as an assistant reply.
+    assert [row["role"] for row in db.get_messages(conversation_id)] == ["user"]
+
+
+
 def test_draft_mode_nudges_a_model_that_stops_before_creating_files(base) -> None:
     settings, db, conversation_id, registry, _executed = base
     fake = FakeLLM(
@@ -246,6 +275,116 @@ def test_draft_mode_nudges_a_model_that_stops_before_creating_files(base) -> Non
         "role": "assistant",
         "content": "I will retry reading the files.",
     }
+
+
+class StreamingFakeLLM:
+    """Streams through on_delta so the event ids can be checked, no network."""
+
+    def __init__(
+        self,
+        results: list[tuple[list[str], LLMResult]],
+    ) -> None:
+        self.results = list(results)
+        self.calls: list[dict] = []
+
+    async def stream_chat(self, messages, **kwargs):
+        self.calls.append({"messages": [dict(m) for m in messages], **kwargs})
+        chunks, result = self.results.pop(0)
+        for chunk in chunks:
+            kwargs["on_delta"](chunk)
+        return result
+
+
+def test_streamed_round_shares_one_message_id(base) -> None:
+    settings, db, conversation_id, registry, _executed = base
+    fake = StreamingFakeLLM(
+        [(["Hel", "lo"], LLMResult(content="Hello"))]
+    )
+    agent = MoodleAgent(settings=settings, db=db, browser=None, registry=registry, llm=fake)
+    events: list = []
+    outcome = _run(
+        agent,
+        AgentRun(conversation_id=conversation_id, user_message="Say hello."),
+        events,
+    )
+
+    deltas = [data for kind, _msg, data in events if kind == "assistant_delta"]
+    assert "".join(message for kind, message, _data in events if kind == "assistant_delta") == "Hello"
+    assert len(deltas) == 2
+    delta_ids = {data["message_id"] for data in deltas}
+    assert len(delta_ids) == 1, "every delta of a round must share one id"
+    assert all(data["step"] == 1 for data in deltas)
+
+    finals = [(msg, data) for kind, msg, data in events if kind == "assistant_message"]
+    assert len(finals) == 1, "one model round emits exactly one assistant message"
+    assert finals[0][0] == "Hello"
+    assert finals[0][1]["message_id"] == delta_ids.pop()
+    assert finals[0][1]["final"] is True
+
+    done = [data for kind, _msg, data in events if kind == "done"]
+    assert len(done) == 1
+    assert done[0]["message_id"] == outcome.message_id
+    assert outcome.message_id == finals[0][1]["message_id"], "done finalises the streamed bubble"
+
+
+def test_tool_rounds_use_one_message_id_each(base) -> None:
+    settings, db, conversation_id, registry, executed = base
+    fake = StreamingFakeLLM(
+        [
+            (
+                ["Let me ", "check."],
+                LLMResult(
+                    content="Let me check.",
+                    tool_calls=[ToolCallRequest(name="echo", arguments={"text": "hi"})],
+                ),
+            ),
+            (["All ", "done."], LLMResult(content="All done.")),
+        ]
+    )
+    agent = MoodleAgent(settings=settings, db=db, browser=None, registry=registry, llm=fake)
+    events: list = []
+    outcome = _run(
+        agent,
+        AgentRun(conversation_id=conversation_id, user_message="Please use the echo tool."),
+        events,
+    )
+
+    finals = [(msg, data) for kind, msg, data in events if kind == "assistant_message"]
+    assert [msg for msg, _data in finals] == ["Let me check.", "All done."]
+    assert finals[0][1]["step"] == 1
+    assert finals[0][1]["final"] is False, "a round that calls a tool is not final"
+    assert finals[1][1]["step"] == 2
+    assert finals[1][1]["final"] is True
+    assert finals[0][1]["message_id"] != finals[1][1]["message_id"]
+
+    deltas = [data for kind, _msg, data in events if kind == "assistant_delta"]
+    assert {data["message_id"] for data in deltas} == {
+        finals[0][1]["message_id"],
+        finals[1][1]["message_id"],
+    }
+    done = [data for kind, _msg, data in events if kind == "done"][0]
+    assert done["message_id"] == finals[1][1]["message_id"] == outcome.message_id
+    assert executed == ["hi"]
+
+
+def test_cancelled_round_stops_with_the_streamed_id(base) -> None:
+    settings, db, conversation_id, registry, _executed = base
+    fake = StreamingFakeLLM([(["partial"], LLMResult(content="partial", cancelled=True))])
+    agent = MoodleAgent(settings=settings, db=db, browser=None, registry=registry, llm=fake)
+    events: list = []
+    outcome = _run(
+        agent,
+        AgentRun(conversation_id=conversation_id, user_message="Please use the echo tool."),
+        events,
+    )
+
+    assert outcome.cancelled is True
+    stopped = [data for kind, _msg, data in events if kind == "stopped"]
+    assert len(stopped) == 1
+    deltas = [data for kind, _msg, data in events if kind == "assistant_delta"]
+    assert stopped[0]["message_id"] == deltas[0]["message_id"]
+    assert stopped[0]["message_id"] == outcome.message_id
+    assert not any(kind in ("assistant_message", "done") for kind, _m, _d in events)
 
 
 def test_chat_mode_is_never_nudged(base) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import shutil
 import time
@@ -44,22 +45,26 @@ class FakeLLM:
     def __init__(self, answer: str = "Hello from the fake model.") -> None:
         self.answer = answer
         self.calls = 0
+        self.last_messages: list[dict] = []
 
     async def health(self) -> dict:
         return {
             "ok": True,
             "reachable": True,
             "host": "http://localhost:11434",
-            "model": "qwen3:8b",
+            "model": "qwen3.5:9b",
             "installed": True,
-            "models": [{"name": "qwen3:8b", "size_bytes": 5_200_000_000, "modified_at": ""}],
-            "running": ["qwen3:8b"],
+            "models": [
+                {"name": "qwen3.5:9b", "size_bytes": 5_200_000_000, "modified_at": ""}
+            ],
+            "running": ["qwen3.5:9b"],
             "error": None,
             "latency_ms": 1.0,
         }
 
     async def stream_chat(self, messages, **kwargs):
         self.calls += 1
+        self.last_messages = list(messages)
         on_delta = kwargs.get("on_delta")
         if on_delta:
             on_delta(self.answer[:10])
@@ -440,3 +445,239 @@ def test_chat_turn_completes_and_persists(api) -> None:
             break
         time.sleep(0.05)
     assert state.agent_state()["running"] is False
+
+
+def test_chat_events_carry_stable_message_ids(api) -> None:
+    client, state, _settings = api
+    seen: list[tuple[str, str, dict | None]] = []
+    original = state.emit
+
+    def record(kind, message, data=None):
+        seen.append((kind, message, data))
+        original(kind, message, data)
+
+    state.emit = record  # type: ignore[method-assign]
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "Say hello"},
+            headers={"X-Owlet": "1"},
+        )
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not state.agent_state()["running"]:
+                break
+            time.sleep(0.05)
+    finally:
+        state.emit = original  # type: ignore[method-assign]
+
+    users = [data for kind, _msg, data in seen if kind == "user_message"]
+    assert len(users) == 1
+    assert users[0]["message_id"] == f"{run_id}:user"
+
+    deltas = [data for kind, _msg, data in seen if kind == "assistant_delta"]
+    finals = [data for kind, _msg, data in seen if kind == "assistant_message"]
+    done = [data for kind, _msg, data in seen if kind == "done"]
+    assert deltas and len(finals) == 1 and len(done) == 1
+    assert len({data["message_id"] for data in deltas}) == 1
+    streamed_id = deltas[0]["message_id"]
+    assert finals[0]["message_id"] == streamed_id
+    assert done[0]["message_id"] == streamed_id, "done must finalise the streamed bubble"
+
+
+# ---------- chat images, regenerate, conversation management ----------
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+PNG_B64 = base64.b64encode(PNG).decode("ascii")
+
+
+def _wait_idle(client, timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get("/api/agent/status").json()
+        if not status["running"] and status["status"] == "idle":
+            return
+        time.sleep(0.05)
+    raise AssertionError("The agent did not become idle in time.")
+
+
+def test_image_only_chat_is_stored_served_and_sent_to_the_model(api) -> None:
+    client, state, settings = api
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "message": "",
+            "images": [{"name": "photo.png", "mime": "image/png", "data": PNG_B64}],
+        },
+        headers={"X-Owlet": "1"},
+    )
+    assert response.status_code == 200
+    conversation_id = response.json()["conversation_id"]
+    _wait_idle(client)
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()["messages"]
+    user_message = messages[0]
+    # An image with no words still gets stable prompt text, for Regenerate.
+    assert user_message["content"].startswith("Please look at the attached image")
+    assert user_message["images"][0]["mime"] == "image/png"
+    url = user_message["images"][0]["url"]
+    assert url.startswith(f"/api/chat/images/{conversation_id}/")
+
+    served = client.get(url)
+    assert served.status_code == 200
+    assert served.headers["content-type"] == "image/png"
+    assert served.content == PNG
+
+    # The bytes reach the model as base64, on the newest user turn.
+    assert state.llm.last_messages[-1]["role"] == "user"
+    assert state.llm.last_messages[-1]["images"] == [PNG_B64]
+
+    stored = settings.chat_images_dir / str(conversation_id)
+    assert len(list(stored.glob("*.png"))) == 1
+
+
+def test_invalid_or_excess_images_are_rejected_cleanly(api) -> None:
+    client, state, settings = api
+
+    not_an_image = base64.b64encode(b"this is text").decode("ascii")
+    rejected = client.post(
+        "/api/chat",
+        json={"message": "look", "images": [{"name": "x.txt", "data": not_an_image}]},
+        headers={"X-Owlet": "1"},
+    )
+    assert rejected.status_code == 400
+    assert "PNG, JPEG, WebP, or GIF" in rejected.json()["detail"]
+
+    # The failed first message must not leave an empty conversation behind.
+    assert client.get("/api/conversations").json()["conversations"] == []
+    assert list(settings.chat_images_dir.glob("*")) == []
+
+    too_many = client.post(
+        "/api/chat",
+        json={
+            "message": "look",
+            "images": [
+                {"name": f"{index}.png", "data": PNG_B64}
+                for index in range(state.settings.max_images_per_message + 1)
+            ],
+        },
+        headers={"X-Owlet": "1"},
+    )
+    assert too_many.status_code == 400
+    assert "at most" in too_many.json()["detail"]
+
+    assert client.get("/api/conversations").json()["conversations"] == []
+
+
+def test_chat_image_route_refuses_anything_outside_its_folder(api) -> None:
+    client, state, _settings = api
+
+    conversation_id = state.db.create_conversation("Images")
+    unknown = f"/api/chat/images/{conversation_id}/{'a' * 32}.png"
+    assert client.get(unknown).status_code == 404
+
+    traversal = client.get(
+        f"/api/chat/images/{conversation_id}/..%2F..%2F..%2Fowlet.db"
+    )
+    assert traversal.status_code == 404
+
+    wrong_name = client.get(f"/api/chat/images/{conversation_id}/photo.png")
+    assert wrong_name.status_code == 404
+
+
+def test_regenerate_replaces_the_last_answer_without_duplicating_the_question(api) -> None:
+    client, state, _settings = api
+
+    first = client.post(
+        "/api/chat", json={"message": "Explain joins"}, headers={"X-Owlet": "1"}
+    )
+    conversation_id = first.json()["conversation_id"]
+    _wait_idle(client)
+    assert state.llm.calls == 1
+
+    again = client.post(
+        "/api/chat/regenerate",
+        json={"conversation_id": conversation_id},
+        headers={"X-Owlet": "1"},
+    )
+    assert again.status_code == 200
+    assert again.json()["conversation_id"] == conversation_id
+    _wait_idle(client)
+    assert state.llm.calls == 2
+
+    messages = client.get(f"/api/conversations/{conversation_id}/messages").json()["messages"]
+    assert [row["role"] for row in messages] == ["user", "assistant"]
+    assert messages[0]["content"] == "Explain joins"
+    assert messages[-1]["content"] == "Hello from the fake model."
+
+    unknown = client.post(
+        "/api/chat/regenerate",
+        json={"conversation_id": 9999},
+        headers={"X-Owlet": "1"},
+    )
+    assert unknown.status_code == 400
+
+
+def test_conversations_can_be_renamed_and_deleted_with_their_images(api) -> None:
+    client, state, settings = api
+
+    created = client.post(
+        "/api/chat",
+        json={"message": "Look", "images": [{"name": "a.png", "data": PNG_B64}]},
+        headers={"X-Owlet": "1"},
+    )
+    conversation_id = created.json()["conversation_id"]
+    _wait_idle(client)
+    image_url = client.get(f"/api/conversations/{conversation_id}/messages").json()[
+        "messages"
+    ][0]["images"][0]["url"]
+    assert client.get(image_url).status_code == 200
+
+    blocked = client.patch(
+        f"/api/conversations/{conversation_id}", json={"title": "Renamed"}
+    )
+    assert blocked.status_code == 403
+
+    renamed = client.patch(
+        f"/api/conversations/{conversation_id}",
+        json={"title": "  Renamed  chat "},
+        headers={"X-Owlet": "1"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["conversation"]["title"] == "Renamed chat"
+
+    blank = client.patch(
+        f"/api/conversations/{conversation_id}",
+        json={"title": "   "},
+        headers={"X-Owlet": "1"},
+    )
+    assert blank.status_code == 400
+
+    missing = client.patch(
+        "/api/conversations/9999", json={"title": "Nope"}, headers={"X-Owlet": "1"}
+    )
+    assert missing.status_code == 404
+
+    deleted = client.delete(
+        f"/api/conversations/{conversation_id}", headers={"X-Owlet": "1"}
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["images_removed"] == 1
+
+    assert client.get(f"/api/conversations/{conversation_id}/messages").status_code == 404
+    assert client.get(image_url).status_code == 404
+    assert not (settings.chat_images_dir / str(conversation_id)).exists()
+    assert state.db.list_conversations() == []
+
+    # Deleting again is a clear 404, not a silent success.
+    assert (
+        client.delete(f"/api/conversations/{conversation_id}", headers={"X-Owlet": "1"})
+        .status_code
+        == 404
+    )

@@ -12,6 +12,13 @@ from typing import Any
 
 from agent.llm import OllamaService
 from agent.loop import AgentOutcome, AgentRun, MoodleAgent
+from app.chat_images import (
+    ImageAttachmentError,
+    delete_conversation_images,
+    read_image,
+    save_images,
+    with_urls,
+)
 from app.config import Settings, load_settings
 from app.drafts import (
     build_draft_request,
@@ -161,27 +168,95 @@ class AppState:
                 "Still fetching your Moodle data. Send your message when the sync finishes."
             )
 
-    async def start_chat(self, message: str, conversation_id: int | None = None) -> tuple[int, str]:
+    async def start_chat(
+        self,
+        message: str,
+        conversation_id: int | None = None,
+        images: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, str]:
         self._ensure_can_run()
+        uploads = list(images or [])
         cleaned = message.strip()
-        if not cleaned:
+        if not cleaned and not uploads:
             raise ValueError("Message is empty")
         if len(cleaned) > 8000:
             raise ValueError("Message is too long (maximum 8000 characters).")
+        if not uploads and not cleaned:
+            raise ValueError("Message is empty")
 
+        # An image-only message still needs prompt text so history and
+        # Regenerate have something stable to replay.
+        content = cleaned or "Please look at the attached image and tell me what matters."
+        created = conversation_id is None
         try:
-            cid = self.db.ensure_conversation(conversation_id, cleaned)
+            cid = self.db.ensure_conversation(conversation_id, content)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
-        self.db.add_message(cid, "user", cleaned)
-        run = AgentRun(conversation_id=cid, user_message=cleaned)
+        saved: list[dict[str, Any]] = []
+        if uploads:
+            try:
+                saved = save_images(
+                    self.settings,
+                    cid,
+                    uploads,
+                    max_count=self.settings.max_images_per_message,
+                )
+            except ImageAttachmentError as exc:
+                # A rejected first message must not leave an empty conversation
+                # behind: nothing was said, so there is nothing to keep.
+                if created:
+                    delete_conversation_images(self.settings, cid)
+                    self.db.delete_conversation(cid)
+                raise ValueError(str(exc)) from exc
+
+        self.db.add_message(cid, "user", content, images=saved or None)
+        run = AgentRun(conversation_id=cid, user_message=content)
         self.active_run = run
         self.active_run_id = uuid.uuid4().hex[:12]
         self._set_status("running")
-        self.emit("user_message", cleaned, {"conversation_id": cid})
+        self.emit(
+            "user_message",
+            content,
+            {
+                "conversation_id": cid,
+                "images": with_urls(cid, saved),
+                "message_id": f"{self.active_run_id}:user",
+            },
+        )
         self._task = asyncio.create_task(self._run_agent(run))
         return cid, self.active_run_id
+
+    async def regenerate(self, conversation_id: int) -> dict[str, Any]:
+        """Drop the last answer and run the last user turn again.
+
+        The user message (and any images on it) stays in place, so the model
+        sees exactly the same question; only the assistant reply is replaced.
+        """
+
+        self._ensure_can_run()
+        if not self.db.conversation_exists(conversation_id):
+            raise ValueError("Conversation not found.")
+        last = self.db.last_user_message(conversation_id)
+        if last is None:
+            raise ValueError("There is no question to regenerate yet.")
+
+        self.db.delete_replies_after(conversation_id, int(last["id"]))
+        content = str(last.get("content") or "")
+        run = AgentRun(conversation_id=conversation_id, user_message=content)
+        self.active_run = run
+        self.active_run_id = uuid.uuid4().hex[:12]
+        self._set_status("running")
+        self.emit(
+            "regenerate",
+            content,
+            {
+                "conversation_id": conversation_id,
+                "images": with_urls(conversation_id, last.get("images") or []),
+            },
+        )
+        self._task = asyncio.create_task(self._run_agent(run))
+        return {"conversation_id": conversation_id, "run_id": self.active_run_id}
 
     async def _run_agent(self, run: AgentRun) -> None:
         try:
@@ -203,6 +278,50 @@ class AppState:
             self.active_run_id = None
             self._task = None
             self._set_status("idle")
+
+    # ---------- conversations ----------
+
+    def rename_conversation(self, conversation_id: int, title: str) -> dict[str, Any]:
+        if not self.db.conversation_exists(conversation_id):
+            raise LookupError("Conversation not found.")
+        if not self.db.rename_conversation(conversation_id, title):
+            raise ValueError("A conversation needs a name.")
+        row = next(
+            (
+                item
+                for item in self.db.list_conversations(200)
+                if item["id"] == conversation_id
+            ),
+            None,
+        )
+        self.emit(
+            "conversation_renamed",
+            f"Renamed to {title.strip()[:80]}",
+            {"conversation": row},
+        )
+        return {"ok": True, "conversation": row}
+
+    def delete_conversation(self, conversation_id: int) -> dict[str, Any]:
+        if not self.db.conversation_exists(conversation_id):
+            raise LookupError("Conversation not found.")
+        if (
+            self.active_run is not None
+            and self.active_run.conversation_id == conversation_id
+            and self._task is not None
+            and not self._task.done()
+        ):
+            raise BusyError("Stop the agent before deleting the conversation it is working in.")
+        removed = delete_conversation_images(self.settings, conversation_id)
+        self.db.delete_conversation(conversation_id)
+        self.emit(
+            "conversation_deleted",
+            "Conversation deleted",
+            {"conversation_id": conversation_id, "images_removed": removed},
+        )
+        return {"ok": True, "images_removed": removed}
+
+    def chat_image(self, conversation_id: int, file_name: str) -> tuple[bytes, str]:
+        return read_image(self.settings, conversation_id, file_name)
 
     # ---------- assignment drafts ----------
 
@@ -277,7 +396,11 @@ class AppState:
         self.emit(
             "user_message",
             message,
-            {"conversation_id": cid, "draft_assignment_id": assignment_id},
+            {
+                "conversation_id": cid,
+                "draft_assignment_id": assignment_id,
+                "message_id": f"{self.active_run_id}:user",
+            },
         )
         self.emit(
             "draft",
@@ -710,6 +833,7 @@ class AppState:
             "approvals": counts.get("approvals", 0),
             "workspace_files": self._clear_tree(self.settings.workspace_dir),
             "generated_files": self._clear_tree(self.settings.generated_dir),
+            "chat_images": self._clear_tree(self.settings.chat_images_dir),
             "login_kept": True,
         }
         # Logged after the wipe so the activity panel shows the reset itself.
@@ -804,7 +928,12 @@ class AppState:
         return rows
 
     def conversation_messages(self, conversation_id: int) -> list[dict[str, Any]]:
-        return self.db.get_messages(conversation_id, limit=200)
+        messages = self.db.get_messages(conversation_id, limit=200)
+        for message in messages:
+            refs = message.get("images")
+            if isinstance(refs, list) and refs:
+                message["images"] = with_urls(conversation_id, refs)
+        return messages
 
     def tool_list(self) -> list[dict[str, Any]]:
         return [
@@ -831,6 +960,7 @@ class AppState:
             "conversations": self.db.list_conversations(20),
             "files": self.workspace_tree(),
             "approvals": self.pending_approvals(),
+            "chat": self.chat_config(),
             "started_at": self._started_at,
         }
 
@@ -841,6 +971,15 @@ class AppState:
             "approvals": self.pending_approvals(),
             "moodle_url": self._moodle_url or "",
             "sync": self.sync_state(),
+            "conversations": self.db.list_conversations(50),
+        }
+
+    def chat_config(self) -> dict[str, Any]:
+        return {
+            "model": self.settings.ollama_model,
+            "max_images": self.settings.max_images_per_message,
+            "max_image_mb": self.settings.max_image_mb,
+            "mime_types": ["image/png", "image/jpeg", "image/webp", "image/gif"],
         }
 
     # ---------- shutdown ----------

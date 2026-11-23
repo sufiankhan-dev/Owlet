@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -16,6 +17,7 @@ from pydantic import ValidationError
 
 from agent.llm import LLMError, LLMResult, OllamaService, ToolCallRequest
 from agent.prompts import build_draft_prompt, build_system_prompt
+from app.chat_images import attach_prompt_images
 from app.config import Settings
 from app.security import truncate_text
 from browser.session import BrowserSession
@@ -51,6 +53,9 @@ class AgentOutcome:
     steps: int = 0
     tool_calls: int = 0
     model: str = ""
+    # Stable id of the last assistant message this run streamed. The dashboard
+    # uses it to finalise exactly one bubble instead of appending a second copy.
+    message_id: str = ""
 
 
 @dataclass
@@ -118,19 +123,37 @@ class MoodleAgent:
         system_prompt = build_system_prompt(
             tool_names=self.registry.names(),
             workspace_root=str(self.settings.workspace_dir),
+            model=self.settings.ollama_model,
         )
         if run.mode == "draft":
             system_prompt += build_draft_prompt()
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for message in history[-10:]:
             content = str(message.get("content") or "").strip()
-            if not content:
+            refs = message.get("images")
+            if not content and not refs:
                 continue
-            messages.append(
-                {"role": message["role"], "content": truncate_text(content, 6000)}
-            )
+            entry: dict[str, Any] = {
+                "role": message["role"],
+                "content": truncate_text(content, 6000) if content else "",
+            }
+            if message["role"] == "user" and isinstance(refs, list) and refs:
+                entry["images"] = refs
+            messages.append(entry)
 
-        emit("status", "Thinking with qwen3:8b", {"model": self.settings.ollama_model})
+        # Vision input is re-encoded from disk each turn (the DB stores only a
+        # reference), bounded so a long chat cannot swamp the context window.
+        attached_images = attach_prompt_images(
+            self.settings, run.conversation_id, messages
+        )
+        if attached_images:
+            logger.info("Attached %s image(s) to the prompt", attached_images)
+
+        emit(
+            "status",
+            f"Thinking with {self.settings.ollama_model}",
+            {"model": self.settings.ollama_model},
+        )
         outcome = AgentOutcome(model=self.settings.ollama_model)
         files_created = 0
         nudges = 0
@@ -143,16 +166,27 @@ class MoodleAgent:
             outcome.steps = step
             ctx.log("agent", f"Model round {step}", {"model": self.settings.ollama_model})
 
+            # One stable id per model round. Every delta and the final message
+            # event carry it, so the dashboard can stream into exactly one
+            # bubble and never append the same answer a second time.
+            message_id = uuid.uuid4().hex[:12]
+            outcome.message_id = message_id
+
             try:
                 result = await self.llm.stream_chat(
                     messages,
                     tools=self.registry.schemas(),
-                    on_delta=lambda delta: emit("assistant_delta", delta, None),
+                    on_delta=lambda delta, mid=message_id, round_no=step: emit(
+                        "assistant_delta",
+                        delta,
+                        {"message_id": mid, "step": round_no},
+                    ),
                     should_stop=lambda: run.stop_requested,
                 )
             except LLMError as exc:
                 outcome.error = exc.message
-                ctx.log("error", exc.message, {"kind": exc.kind})
+                # _finish emits the single "error" event; logging it here too
+                # would duplicate the bubble and the activity row in the UI.
                 return await self._finish(run, outcome, emit, exc.message)
             except Exception as exc:
                 logger.exception("Unexpected model failure")
@@ -164,7 +198,15 @@ class MoodleAgent:
                 return await self._finish(run, outcome, emit, "Stopped by user")
 
             if result.content:
-                emit("assistant_message", result.content, None)
+                emit(
+                    "assistant_message",
+                    result.content,
+                    {
+                        "message_id": message_id,
+                        "step": step,
+                        "final": not result.tool_calls,
+                    },
+                )
 
             if (
                 not result.tool_calls
@@ -195,7 +237,7 @@ class MoodleAgent:
                     # Reported once, by _finish.
                     outcome.error = (
                         "The model returned an empty response. Try rephrasing, or check that "
-                        "qwen3:8b is running."
+                        f"{self.settings.ollama_model} is installed and running."
                     )
                 return await self._finish(run, outcome, emit, outcome.content)
 
@@ -338,9 +380,13 @@ class MoodleAgent:
             except Exception:
                 logger.exception("Could not save assistant message")
         if outcome.cancelled:
-            emit("stopped", "Agent stopped", {"steps": outcome.steps})
+            emit(
+                "stopped",
+                "Agent stopped",
+                {"steps": outcome.steps, "message_id": outcome.message_id},
+            )
         elif outcome.error:
-            emit("error", outcome.error, None)
+            emit("error", outcome.error, {"message_id": outcome.message_id})
         else:
             emit(
                 "done",
@@ -349,6 +395,7 @@ class MoodleAgent:
                     "steps": outcome.steps,
                     "tool_calls": outcome.tool_calls,
                     "model": outcome.model,
+                    "message_id": outcome.message_id,
                 },
             )
         return outcome

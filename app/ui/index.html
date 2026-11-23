@@ -11,10 +11,10 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">M</div>
+        <div class="brand-mark" aria-hidden="true">O</div>
         <div class="brand-text">
           <h1>Owlet</h1>
-          <p>Local study assistant · qwen3:8b</p>
+          <p>Local study assistant · <span id="brandModel">local model</span></p>
         </div>
       </div>
 
@@ -31,13 +31,25 @@
       </div>
 
       <div class="topbar-actions">
-        <button id="stopBtn" class="btn btn-danger" type="button" disabled>Stop agent</button>
-        <button id="themeBtn" class="btn btn-icon" type="button" aria-label="Toggle dark and light theme" title="Toggle theme">◐</button>
+        <button id="stopBtn" class="btn btn-danger" type="button" disabled>Stop</button>
+        <button id="themeBtn" class="btn btn-icon" type="button" aria-label="Toggle dark and light theme" title="Toggle theme">☐</button>
       </div>
     </header>
 
     <main class="layout">
       <aside class="sidebar">
+        <section class="card chats-card" data-card="chats">
+          <div class="card-head">
+            <h2><button class="card-toggle" type="button" aria-expanded="true" aria-controls="chatsBody">Chats <span id="chatCount" class="count"></span></button></h2>
+            <button class="icon-btn" data-new-chat type="button" aria-label="Start a new chat" title="New chat">＋</button>
+          </div>
+          <div class="card-body" id="chatsBody">
+            <div id="conversationList" class="conv-list">
+              <p class="empty">No conversations yet.</p>
+            </div>
+          </div>
+        </section>
+
         <section class="card connection-card" data-card="connection">
           <div class="card-head">
             <h2><button class="card-toggle" type="button" aria-expanded="true" aria-controls="connectionBody">Moodle connection</button></h2>
@@ -98,33 +110,66 @@
         </section>
       </aside>
 
-      <section class="chat-panel" aria-label="Chat">
+      <section class="chat-panel" aria-label="Chat" id="chatPanel">
         <div class="chat-head">
-          <div>
+          <div class="chat-head-text">
             <h2 id="chatTitle">New conversation</h2>
-            <p id="chatSubtitle">Ask about a course, assignment, PDF, or study task.</p>
+            <p id="chatSubtitle">Ask about a course, assignment, PDF, or an image you attach.</p>
           </div>
-          <button id="newChatBtn" class="btn btn-ghost small" type="button">New chat</button>
+          <button class="btn btn-ghost small" data-new-chat type="button">New chat</button>
         </div>
 
-        <div id="messages" class="messages" aria-live="polite">
-          <div class="welcome">
-            <div class="welcome-mark" aria-hidden="true">M</div>
-            <h2>Your Moodle, with a local brain.</h2>
-            <p>Log in once and your courses, assignments, instructions, and files are fetched automatically. Ask about any of them — everything runs on your laptop.</p>
-            <div class="suggestions" id="suggestions"></div>
+        <div id="modelNotice" class="model-notice hidden" role="status">
+          <div class="model-notice-text">
+            <strong id="modelNoticeTitle">Model not installed</strong>
+            <span id="modelNoticeBody"></span>
           </div>
+          <code id="modelNoticeCommand"></code>
+        </div>
+
+        <div class="chat-body">
+          <div id="messages" class="messages" aria-live="polite">
+            <div class="welcome">
+              <div class="welcome-mark" aria-hidden="true">O</div>
+              <h2>Your Moodle, with a private brain.</h2>
+              <p>Log in once and your courses, assignments, instructions, and files are fetched automatically. Ask about any of them, or attach a screenshot, photo, or diagram to ask about it — no cloud service is ever involved.</p>
+              <div class="suggestions" id="suggestions"></div>
+            </div>
+          </div>
+          <button id="scrollBtn" class="scroll-btn hidden" type="button" aria-label="Scroll to the latest message" title="Jump to latest">
+            <span aria-hidden="true">↓</span>
+          </button>
         </div>
 
         <div id="approvalBar" class="approval-bar hidden" role="status"></div>
 
-        <form id="composer" class="composer" autocomplete="off">
-          <textarea id="messageInput" rows="1" placeholder="Ask Owlet…" aria-label="Message"></textarea>
-          <button id="sendBtn" class="btn btn-primary send" type="submit">Send</button>
-        </form>
-        <div class="composer-meta">
-          <span id="agentActivity">Ready</span>
-          <span id="modelMeta">qwen3:8b · local</span>
+        <div class="composer-wrap">
+          <div id="attachments" class="attachments hidden" aria-label="Attached images"></div>
+          <form id="composer" class="composer" autocomplete="off">
+            <button id="attachBtn" class="btn-icon attach-btn" type="button" aria-label="Attach images" title="Attach images (or paste, or drop them here)">
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l8.8-8.8a4 4 0 0 1 5.7 5.7l-8.8 8.8a2 2 0 0 1-2.9-2.9l8.2-8.1"/>
+              </svg>
+            </button>
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <textarea id="messageInput" rows="1" placeholder="Ask Owlet… (attach an image with the paperclip)" aria-label="Message"></textarea>
+            <button id="sendBtn" class="btn btn-primary send" type="submit" aria-label="Send message" title="Send (Enter)">
+              <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V5M6 11l6-6 6 6"/>
+              </svg>
+            </button>
+          </form>
+          <div class="composer-meta">
+            <span id="agentActivity">Ready</span>
+            <span class="composer-hint">Enter to send · Shift+Enter for a new line</span>
+            <span id="modelMeta">model · status unknown</span>
+          </div>
+        </div>
+        <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true">
+          <div class="drop-card">
+            <strong>Drop images to attach</strong>
+            <span>PNG, JPEG, WebP, or GIF</span>
+          </div>
         </div>
       </section>
 
@@ -179,7 +224,7 @@
         <button id="draftReviewBtn" class="btn" type="button">Mark reviewed</button>
         <button id="draftStartBtn" class="btn btn-primary" type="button">Draft with AI</button>
       </div>
-      <p class="modal-note">Drafts are written by the local model and saved in this assignment's folder. Read every file before you hand it in. Owlet never submits to Moodle; you upload the work yourself.</p>
+      <p class="modal-note">Drafts are written by the configured model and saved in this assignment's folder. Read every file before you hand it in. Owlet never submits to Moodle; you upload the work yourself.</p>
     </div>
   </div>
 

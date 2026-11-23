@@ -95,6 +95,19 @@
     draftStartBtn: $("draftStartBtn"),
     toast: $("toast"),
     toolCount: $("toolCount"),
+    brandModel: $("brandModel"),
+    chatCount: $("chatCount"),
+    conversationList: $("conversationList"),
+    chatPanel: $("chatPanel"),
+    attachments: $("attachments"),
+    attachBtn: $("attachBtn"),
+    imageInput: $("imageInput"),
+    dropOverlay: $("dropOverlay"),
+    scrollBtn: $("scrollBtn"),
+    modelNotice: $("modelNotice"),
+    modelNoticeTitle: $("modelNoticeTitle"),
+    modelNoticeBody: $("modelNoticeBody"),
+    modelNoticeCommand: $("modelNoticeCommand"),
   };
 
   const welcomeMarkup = els.messages ? els.messages.innerHTML : "";
@@ -105,12 +118,18 @@
 
   const state = {
     conversationId: null,
+    conversations: [],
     running: false,
+    sending: false,
     conversationStarted: false,
-    streamingEl: null,
-    streamingText: "",
+    // The assistant message currently being streamed:
+    // { id, msg, bubble, body, text, frame, done }.
+    stream: null,
+    waitingEl: null,
     lastAssistantEl: null,
+    lastUserMessageEl: null,
     lastUserText: "",
+    attachmentSeq: 0,
     pendingTools: [],
     approvals: new Map(),
     currentApprovalId: null,
@@ -127,6 +146,9 @@
     lastBrowser: null,
     draftId: null,
     draft: null,
+    attachments: [],
+    chatConfig: { max_images: 4, max_image_mb: 8 },
+    ollama: null,
   };
 
   let toastTimer = 0;
@@ -212,6 +234,32 @@
       second: "2-digit",
       hour12: false,
     });
+  }
+
+  function relativeTime(value) {
+    if (!value) return "";
+    const date = new Date(String(value).replace(" ", "T"));
+    if (Number.isNaN(date.getTime())) return "";
+    const seconds = Math.round((Date.now() - date.getTime()) / 1000);
+    if (seconds < 45) return "just now";
+    if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))}m ago`;
+    if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+    if (seconds < 604800) return `${Math.round(seconds / 86400)}d ago`;
+    return date.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+
+  function modelName() {
+    return state.chatConfig?.model || state.ollama?.model || "local model";
+  }
+
+  function maxImages() {
+    const value = Number(state.chatConfig?.max_images);
+    return Number.isFinite(value) && value > 0 ? value : 4;
+  }
+
+  function maxImageBytes() {
+    const value = Number(state.chatConfig?.max_image_mb);
+    return (Number.isFinite(value) && value > 0 ? value : 8) * 1024 * 1024;
   }
 
   function humanize(value) {
@@ -321,8 +369,15 @@
       return `\u0000${codes.length - 1}\u0000`;
     });
 
+    // Models sometimes emit escaped markers (\*\*bold\*\*) or names with
+    // underscores. Unescape the punctuation so the intent renders instead of
+    // showing literal backslashes.
+    out = out.replace(/\\([\\`*_{}\[\]()#+\-.!>~|])/g, "$1");
+
     out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
     out = out.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    out = out.replace(/(^|[^\w_])_([^_\n]+)_(?![\w_])/g, "$1<em>$2</em>");
     out = out.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
 
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
@@ -335,17 +390,199 @@
     return out;
   }
 
-  function renderMarkdown(source) {
-    const escaped = escapeHtml(source).replace(/\r\n?/g, "\n");
-    const lines = escaped.split("\n");
-    const html = [];
+  // Small, dependency-free syntax highlighter for fenced code blocks. It runs on
+  // the raw text and escapes every token, so model output can never inject HTML.
+  const CODE_KEYWORDS =
+    "abstract|async|await|break|case|catch|class|const|continue|def|default|del|elif|else|" +
+    "except|export|extends|False|false|finally|float|for|from|function|global|if|implements|" +
+    "import|in|int|interface|is|lambda|let|match|new|None|none|null|of|or|pass|private|" +
+    "protected|public|raise|return|self|static|str|switch|throw|True|true|try|type|typeof|" +
+    "undefined|var|void|while|with|yield";
 
+  const CODE_TOKEN = new RegExp(
+    [
+      "(\\/\\/[^\\n]*|#[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)",
+      "(\"(?:[^\"\\\\\\n]|\\\\.)*\"|'(?:[^'\\\\\\n]|\\\\.)*'|`(?:[^`\\\\]|\\\\.)*`)",
+      "(\\b(?:0x[0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b)",
+      `(\\b(?:${CODE_KEYWORDS})\\b)`,
+    ].join("|"),
+    "g"
+  );
+
+  function highlightCode(raw) {
+    const text = String(raw ?? "");
+    let out = "";
+    let last = 0;
+    CODE_TOKEN.lastIndex = 0;
+    let match = CODE_TOKEN.exec(text);
+    while (match) {
+      out += escapeHtml(text.slice(last, match.index));
+      const kind = match[1]
+        ? "comment"
+        : match[2]
+          ? "string"
+          : match[3]
+            ? "number"
+            : "keyword";
+      out += `<span class="tok-${kind}">${escapeHtml(match[0])}</span>`;
+      last = match.index + match[0].length;
+      match = CODE_TOKEN.exec(text);
+    }
+    out += escapeHtml(text.slice(last));
+    return out;
+  }
+
+  function renderCodeBlock(raw, lang) {
+    const cls = lang ? ` class="language-${escapeAttr(lang)}"` : "";
+    return `<pre><code${cls}>${highlightCode(raw)}</code></pre>`;
+  }
+
+  // A compact block parser. It is deliberately dependency-free and runs
+  // safely on partial text, so an unfinished response can be rendered on every
+  // animation frame without waiting for the closing markers.
+  const LIST_ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+  const TABLE_SEPARATOR = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+
+  function tableCells(line) {
+    let text = String(line || "").trim();
+    if (text.startsWith("|")) text = text.slice(1);
+    if (text.endsWith("|")) text = text.slice(0, -1);
+    const cells = [];
+    let current = "";
+    for (let i = 0; i < text.length; i += 1) {
+      const char = text[i];
+      if (char === "\\" && text[i + 1] === "|") {
+        current += "|";
+        i += 1;
+        continue;
+      }
+      if (char === "|") {
+        cells.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    cells.push(current.trim());
+    return cells;
+  }
+
+  function tableAlignment(cell) {
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return "";
+  }
+
+  function renderTable(lines, start) {
+    const header = tableCells(lines[start]);
+    const alignments = tableCells(lines[start + 1]).map(tableAlignment);
+    let i = start + 2;
+    const rows = [];
+    while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+      rows.push(tableCells(lines[i]));
+      i += 1;
+    }
+
+    const alignClass = (index) =>
+      alignments[index] ? ` class="ta-${alignments[index]}"` : "";
+    const head = header
+      .map((cell, index) => `<th${alignClass(index)}>${inlineMarkdown(cell)}</th>`)
+      .join("");
+    const body = rows
+      .map(
+        (row) =>
+          `<tr>${header
+            .map(
+              (_cell, index) =>
+                `<td${alignClass(index)}>${inlineMarkdown(row[index] || "")}</td>`
+            )
+            .join("")}</tr>`
+      )
+      .join("");
+
+    return {
+      html: `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`,
+      next: i,
+    };
+  }
+
+  function renderListBlock(lines, start) {
+    const items = [];
+    let i = start;
+    let previous = null;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const match = line.match(LIST_ITEM);
+      if (match) {
+        const indent = match[1].replace(/\t/g, "  ").length;
+        previous = {
+          indent,
+          ordered: /^\d/.test(match[2]),
+          text: match[3].trim(),
+        };
+        items.push(previous);
+        i += 1;
+        continue;
+      }
+      if (!line.trim()) break;
+      // Indented continuation text belongs to the item above it.
+      if (
+        previous &&
+        /^\s{2,}/.test(line) &&
+        !/^\s*(```+|~~~+|>|#{1,6}\s)/.test(line) &&
+        !TABLE_SEPARATOR.test(line)
+      ) {
+        previous.text += ` ${line.trim()}`;
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    function build(from, indent) {
+      if (from >= items.length) return { html: "", next: from };
+      const type = items[from].ordered ? "ol" : "ul";
+      let out = `<${type}>`;
+      let cursor = from;
+
+      while (cursor < items.length && items[cursor].indent === indent) {
+        if ((items[cursor].ordered ? "ol" : "ul") !== type) break;
+        out += `<li>${inlineMarkdown(items[cursor].text)}`;
+        cursor += 1;
+        while (cursor < items.length && items[cursor].indent > indent) {
+          const child = build(cursor, items[cursor].indent);
+          if (!child.html || child.next <= cursor) break;
+          out += child.html;
+          cursor = child.next;
+        }
+        out += "</li>";
+      }
+
+      out += `</${type}>`;
+      return { html: out, next: cursor };
+    }
+
+    let html = "";
+    let cursor = 0;
+    while (cursor < items.length) {
+      const part = build(cursor, items[cursor].indent);
+      if (!part.html || part.next <= cursor) break;
+      html += part.html;
+      cursor = part.next;
+    }
+    return { html, next: i };
+  }
+
+  function renderMarkdown(source) {
+    const normalized = String(source ?? "").replace(/\r\n?/g, "\n");
+    const rawLines = normalized.split("\n");
+    const lines = escapeHtml(normalized).split("\n");
+    const html = [];
     let paragraph = [];
-    let listType = null;
-    let listItems = [];
-    let inCode = false;
-    let codeLang = "";
-    let codeLines = [];
 
     function flushParagraph() {
       if (!paragraph.length) return;
@@ -353,96 +590,88 @@
       paragraph = [];
     }
 
-    function flushList() {
-      if (!listType) return;
-      html.push(`<${listType}>${listItems.join("")}</${listType}>`);
-      listType = null;
-      listItems = [];
-    }
-
-    function flushAll() {
-      flushParagraph();
-      flushList();
-    }
-
-    for (let i = 0; i < lines.length; i += 1) {
+    let i = 0;
+    while (i < lines.length) {
       const line = lines[i];
 
-      if (/^\s*```/.test(line)) {
-        if (!inCode) {
-          flushAll();
-          inCode = true;
-          codeLang = line.trim().replace(/^```/, "").trim().replace(/[^a-zA-Z0-9+#.-]/g, "");
-          codeLines = [];
-        } else {
-          const cls = codeLang ? ` class="language-${escapeAttr(codeLang)}"` : "";
-          html.push(`<pre><code${cls}>${codeLines.join("\n")}</code></pre>`);
-          inCode = false;
-          codeLang = "";
+      const fence = line.match(/^\s*(`{3,}|~{3,})\s*(.*)$/);
+      if (fence) {
+        flushParagraph();
+        const marker = fence[1][0];
+        const lang = fence[2].trim().replace(/[^a-zA-Z0-9+#.-]/g, "");
+        const closeFence = marker === "`" ? /^\s*`{3,}\s*$/ : /^\s*~{3,}\s*$/;
+        const codeLines = [];
+        i += 1;
+        while (i < lines.length && !closeFence.test(lines[i])) {
+          codeLines.push(rawLines[i]);
+          i += 1;
         }
-        continue;
-      }
-
-      if (inCode) {
-        codeLines.push(line);
+        i += 1; // consume the closing fence (or the end of the text)
+        html.push(renderCodeBlock(codeLines.join("\n"), lang));
         continue;
       }
 
       if (!line.trim()) {
-        flushAll();
+        flushParagraph();
+        i += 1;
         continue;
       }
 
       const heading = line.match(/^(#{1,6})\s+(.*)$/);
       if (heading) {
-        flushAll();
-        const level = heading[1].length === 1 ? "h3" : heading[1].length === 2 ? "h4" : "h5";
+        flushParagraph();
+        const level =
+          heading[1].length === 1 ? "h3" : heading[1].length === 2 ? "h4" : "h5";
         html.push(`<${level}>${inlineMarkdown(heading[2].trim())}</${level}>`);
+        i += 1;
         continue;
       }
 
       if (/^\s*([-*_])\s*(?:\1\s*){2,}$/.test(line)) {
-        flushAll();
+        flushParagraph();
         html.push("<hr>");
+        i += 1;
         continue;
       }
 
-      if (/^>\s?/.test(line)) {
-        flushAll();
+      if (rawLines[i] && /^>\s?/.test(rawLines[i])) {
+        flushParagraph();
         const quote = [];
-        while (i < lines.length && /^>\s?/.test(lines[i])) {
-          quote.push(lines[i].replace(/^>\s?/, ""));
+        while (i < rawLines.length && /^>\s?/.test(rawLines[i])) {
+          quote.push(rawLines[i].replace(/^>\s?/, ""));
           i += 1;
         }
-        i -= 1;
-        html.push(`<blockquote>${inlineMarkdown(quote.join(" "))}</blockquote>`);
+        html.push(`<blockquote>${renderMarkdown(quote.join("\n"))}</blockquote>`);
         continue;
       }
 
-      const unordered = line.match(/^\s*[-*+]\s+(.*)$/);
-      const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-
-      if (unordered || ordered) {
+      if (line.includes("|") && i + 1 < lines.length && TABLE_SEPARATOR.test(lines[i + 1])) {
         flushParagraph();
-        const type = unordered ? "ul" : "ol";
-        if (listType && listType !== type) flushList();
-        listType = type;
-        listItems.push(`<li>${inlineMarkdown((unordered || ordered)[1])}</li>`);
+        const table = renderTable(lines, i);
+        html.push(table.html);
+        i = table.next;
         continue;
       }
 
-      flushList();
+      if (LIST_ITEM.test(line)) {
+        flushParagraph();
+        const list = renderListBlock(lines, i);
+        html.push(list.html);
+        i = list.next;
+        continue;
+      }
+
       paragraph.push(line.trim());
+      i += 1;
     }
 
-    if (inCode && codeLines.length) {
-      html.push(`<pre><code>${codeLines.join("\n")}</code></pre>`);
-    }
-    flushAll();
+    flushParagraph();
     return html.join("");
   }
 
   // ---------- chat rendering ----------
+
+  const IMAGE_ONLY_TEXT = "Please look at the attached image and tell me what matters.";
 
   function nearBottom() {
     if (!els.messages) return true;
@@ -450,11 +679,19 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight < 140;
   }
 
+  function updateScrollButton() {
+    if (!els.messages || !els.scrollBtn) return;
+    const el = els.messages;
+    const overflow = el.scrollHeight - el.clientHeight > 60;
+    els.scrollBtn.classList.toggle("hidden", !overflow || nearBottom());
+  }
+
   function scrollToBottom(force) {
     if (!els.messages) return;
     if (force || nearBottom()) {
       els.messages.scrollTop = els.messages.scrollHeight;
     }
+    updateScrollButton();
   }
 
   function removeWelcome() {
@@ -464,14 +701,212 @@
 
   function restoreWelcome() {
     if (!els.messages) return;
+    resetStream();
     els.messages.innerHTML = welcomeMarkup;
     els.messages.scrollTop = 0;
+    state.lastUserMessageEl = null;
+    state.lastAssistantEl = null;
     renderSuggestions();
+    updateScrollButton();
+  }
+
+  function formatMessageTime(value) {
+    if (!value) return "";
+    const date = new Date(String(value).replace(" ", "T"));
+    if (Number.isNaN(date.getTime())) return "";
+    const sameDay = date.toDateString() === new Date().toDateString();
+    return date.toLocaleString([], {
+      month: sameDay ? undefined : "short",
+      day: sameDay ? undefined : "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function messageImages(images) {
+    const usable = (Array.isArray(images) ? images : []).filter(
+      (image) => image && image.url
+    );
+    if (!usable.length) return null;
+
+    const grid = document.createElement("div");
+    grid.className = "msg-images";
+    usable.forEach((image) => {
+      const link = document.createElement("a");
+      link.href = image.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = image.name || "Attached image";
+      const img = document.createElement("img");
+      img.src = image.url;
+      img.alt = image.name || "Attached image";
+      img.loading = "lazy";
+      link.appendChild(img);
+      grid.appendChild(link);
+    });
+    return grid;
+  }
+
+  function messageActions(msg, options = {}) {
+    const main = msg?.querySelector(".msg-main");
+    if (!main) return null;
+    let row = main.querySelector(".msg-actions");
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "msg-actions";
+      main.appendChild(row);
+    }
+
+    // Idempotent: a repeated final event must not grow a second Copy button on
+    // a message that already has one.
+    const addAction = (act, label, title) => {
+      if (row.querySelector(`.msg-action[data-act="${act}"]`)) return;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "msg-action";
+      button.dataset.act = act;
+      button.textContent = label;
+      if (title) button.title = title;
+      row.appendChild(button);
+    };
+
+    if (options.copy) addAction("copy", "Copy");
+    if (options.regenerate) {
+      addAction(
+        "regenerate",
+        "Regenerate",
+        "Ask the model to answer the last question again"
+      );
+    }
+    row.classList.toggle("hidden", !row.children.length);
+    return row;
+  }
+
+  function clearRegenerateActions() {
+    els.messages?.querySelectorAll('.msg-action[data-act="regenerate"]').forEach((button) => {
+      const row = button.closest(".msg-actions");
+      button.remove();
+      if (row && !row.children.length) row.classList.add("hidden");
+    });
+  }
+
+  function ensureMessageMeta(msg, createdAt) {
+    if (!msg) return null;
+    const main = msg.querySelector(".msg-main");
+    if (!main) return null;
+    let meta = main.querySelector(".msg-meta");
+    if (!meta) {
+      meta = document.createElement("div");
+      meta.className = "msg-meta";
+      main.appendChild(meta);
+    }
+    if (!meta.querySelector(".msg-time") && createdAt) {
+      const time = document.createElement("span");
+      time.className = "msg-time";
+      time.textContent = formatMessageTime(createdAt);
+      time.title = new Date(String(createdAt).replace(" ", "T")).toLocaleString();
+      meta.prepend(time);
+    }
+    return meta;
+  }
+
+  let messageSeq = 0;
+
+  function newMessageId() {
+    messageSeq += 1;
+    return `m-${Date.now().toString(36)}-${messageSeq}`;
+  }
+
+  function messageById(id) {
+    if (!id || !els.messages) return null;
+    return (
+      Array.from(els.messages.querySelectorAll(".msg[data-message-id]")).find(
+        (msg) => msg.dataset.messageId === id
+      ) || null
+    );
+  }
+
+  // Every assistant bubble owns exactly one body element. Streaming re-renders
+  // that same element; it must never append a second copy of the answer.
+  function ensureBubbleBody(bubble) {
+    if (!bubble) return null;
+    let body = bubble.querySelector(".bubble-text");
+    if (!body) {
+      body = document.createElement("div");
+      body.className = "bubble-text";
+    }
+    Array.from(bubble.childNodes).forEach((node) => {
+      if (node === body) return;
+      // A bare text node is what the old streaming path left behind next to the
+      // rendered body, which displayed every answer twice.
+      if (node.nodeType === Node.TEXT_NODE) node.remove();
+    });
+    bubble.querySelectorAll(".bubble-text").forEach((candidate) => {
+      if (candidate !== body) candidate.remove();
+    });
+    if (!body.parentNode) bubble.appendChild(body);
+    return body;
+  }
+
+  function setAssistantBody(msg, text) {
+    if (!msg) return null;
+    const bubble = msg.querySelector(".bubble");
+    if (!bubble) return null;
+    bubble.classList.remove("streaming");
+    const body = ensureBubbleBody(bubble);
+    body.innerHTML = renderMarkdown(text);
+    msg.dataset.rawText = String(text ?? "");
+    state.lastAssistantEl = msg;
+    ensureMessageMeta(msg, new Date().toISOString());
+    clearRegenerateActions();
+    messageActions(msg, { copy: true, regenerate: true });
+    return body;
+  }
+
+  // True only while the same turn is still on screen: a newer user message
+  // means a new question, so an identical answer is legitimate there.
+  function duplicatedAssistant(text, exclude) {
+    let last = state.lastAssistantEl;
+    if (last === exclude) {
+      let node = last?.previousElementSibling || null;
+      last = null;
+      while (node) {
+        if (node.classList?.contains("msg")) {
+          if (node.classList.contains("user")) return null;
+          if (node.classList.contains("assistant")) {
+            last = node;
+            break;
+          }
+        }
+        node = node.previousElementSibling;
+      }
+    }
+    if (!last || !els.messages?.contains(last)) return null;
+    let node = last.nextElementSibling;
+    while (node) {
+      if (node.classList?.contains("msg") && node.classList.contains("user")) return null;
+      node = node.nextElementSibling;
+    }
+    return last.dataset.rawText === String(text) ? last : null;
+  }
+
+  function resetStream() {
+    const stream = state.stream;
+    if (stream) {
+      if (stream.frame) window.cancelAnimationFrame(stream.frame);
+      stream.frame = 0;
+      stream.done = true;
+    }
+    state.stream = null;
   }
 
   function createMessage(role, text, options = {}) {
     const msg = document.createElement("div");
     msg.className = `msg ${role}`;
+    msg.dataset.messageId = options.messageId || newMessageId();
+    if (role === "assistant" && !options.error && !options.notice) {
+      msg.dataset.rawText = String(text ?? "");
+    }
 
     if (role === "assistant") {
       const avatar = document.createElement("div");
@@ -495,29 +930,71 @@
     if (options.error) bubble.classList.add("error");
     if (options.notice) bubble.classList.add("notice");
     if (options.streaming) bubble.classList.add("streaming");
+
+    const images = messageImages(options.images);
+    if (images) bubble.appendChild(images);
+
     if (text) {
-      if (options.plain) bubble.textContent = text;
-      else bubble.innerHTML = renderMarkdown(text);
+      if (options.plain) {
+        const p = document.createElement("div");
+        p.className = "bubble-text";
+        p.textContent = text;
+        bubble.appendChild(p);
+      } else {
+        const body = document.createElement("div");
+        body.className = "bubble-text";
+        body.innerHTML = renderMarkdown(text);
+        bubble.appendChild(body);
+      }
     }
 
     main.appendChild(bubble);
+    ensureMessageMeta(msg, options.createdAt || new Date().toISOString());
+    if (role === "assistant" && options.actions) messageActions(msg, options.actions);
     msg.appendChild(main);
     els.messages.appendChild(msg);
     scrollToBottom(true);
     return { msg, bubble };
   }
 
-  function appendUser(text) {
+  function appendUser(text, images, createdAt, messageId) {
     removeWelcome();
-    createMessage("user", text, { plain: true });
-    state.lastUserText = text;
+    const shown = String(text ?? "");
+    const { msg } = createMessage("user", shown, {
+      plain: true,
+      images,
+      createdAt: createdAt || new Date().toISOString(),
+      messageId,
+    });
+    state.lastUserMessageEl = msg;
+    state.lastUserText = shown;
     state.conversationStarted = true;
+    return msg;
   }
 
   function appendAssistant(text, options = {}) {
     removeWelcome();
-    const { msg, bubble } = createMessage("assistant", text, options);
-    if (!options.streaming) state.lastAssistantEl = msg;
+    const streaming = Boolean(options.streaming);
+    const actions = streaming
+      ? null
+      : options.actions ||
+        (options.error || options.notice
+          ? { copy: true }
+          : { copy: true, regenerate: Boolean(options.regenerate) });
+    const { msg, bubble } = createMessage("assistant", text, {
+      ...options,
+      actions,
+      createdAt: options.createdAt || new Date().toISOString(),
+    });
+    if (options.regenerate) {
+      // Exactly one Regenerate target: the newest answer.
+      els.messages
+        ?.querySelectorAll('.msg-action[data-act="regenerate"]')
+        .forEach((button) => {
+          if (!msg.contains(button)) button.remove();
+        });
+    }
+    if (!streaming) state.lastAssistantEl = msg;
     return { msg, bubble };
   }
 
@@ -529,54 +1006,189 @@
     appendAssistant(text, { notice: true });
   }
 
-  function ensureStreaming() {
-    if (state.streamingEl) return state.streamingEl;
+  function showWaiting(label) {
+    hideWaiting();
+    if (!els.messages) return;
     removeWelcome();
-    const { msg, bubble } = createMessage("assistant", "", { streaming: true });
-    state.streamingEl = bubble;
-    state.streamingText = "";
-    state.lastAssistantEl = msg;
-    return bubble;
+
+    const msg = document.createElement("div");
+    msg.className = "msg assistant waiting";
+
+    const avatar = document.createElement("div");
+    avatar.className = "msg-avatar";
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.textContent = "M";
+
+    const main = document.createElement("div");
+    main.className = "msg-main";
+
+    const author = document.createElement("div");
+    author.className = "msg-author";
+    author.textContent = "Owlet";
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble thinking";
+    bubble.innerHTML =
+      '<span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="thinking-label"></span>';
+    const text = bubble.querySelector(".thinking-label");
+    if (text) text.textContent = label || `Thinking with ${modelName()}…`;
+
+    main.appendChild(author);
+    main.appendChild(bubble);
+    msg.appendChild(avatar);
+    msg.appendChild(main);
+    els.messages.appendChild(msg);
+    state.waitingEl = msg;
+    scrollToBottom(true);
   }
 
-  function finalizeStreaming(finalText) {
-    const bubble = state.streamingEl;
-    const text =
-      finalText === undefined || finalText === null ? state.streamingText : String(finalText);
+  function hideWaiting() {
+    if (state.waitingEl) {
+      state.waitingEl.remove();
+      state.waitingEl = null;
+    }
+  }
 
-    if (!bubble) {
-      state.streamingText = "";
-      if (text.trim()) return appendAssistant(text).msg;
+  function startStreaming(messageId) {
+    hideWaiting();
+    removeWelcome();
+    const { msg, bubble } = createMessage("assistant", "", {
+      streaming: true,
+      messageId: messageId || newMessageId(),
+    });
+    const body = ensureBubbleBody(bubble);
+    const stream = {
+      id: msg.dataset.messageId,
+      msg,
+      bubble,
+      body,
+      text: "",
+      frame: 0,
+      done: false,
+    };
+    state.stream = stream;
+    state.lastAssistantEl = msg;
+    scrollToBottom(true);
+    return stream;
+  }
+
+  function scheduleStreamPreview(stream) {
+    if (!stream || stream.done || stream.frame) return;
+    stream.frame = window.requestAnimationFrame(() => {
+      stream.frame = 0;
+      if (!stream.done) stream.body.innerHTML = renderMarkdown(stream.text);
+    });
+  }
+
+  function appendAssistantDelta(chunk, messageId) {
+    const text = String(chunk ?? "");
+    if (!text) return;
+
+    let stream = state.stream;
+    if (stream && stream.done) stream = null;
+
+    if (!stream) {
+      // A replay of a message that already finished must not open a new bubble.
+      if (messageId && messageById(messageId)) return;
+      stream = startStreaming(messageId);
+    } else if (messageId && stream.id !== messageId) {
+      // A new model round began without a final event for the previous one.
+      finalizeStreaming(undefined, { messageId: stream.id });
+      stream = state.stream;
+      if (messageId && messageById(messageId)) return;
+      if (!stream) stream = startStreaming(messageId);
+    }
+
+    stream.text += text;
+    scheduleStreamPreview(stream);
+    scrollToBottom(false);
+  }
+
+  function upsertAssistantMessage(messageId, text, options = {}) {
+    const existing =
+      (messageId ? messageById(messageId) : null) || duplicatedAssistant(text);
+    if (existing) {
+      // A repeated final event (same id) or the same answer arriving again in
+      // one turn is an update, never a second message with the same content.
+      setAssistantBody(existing, text);
+      return existing;
+    }
+    removeWelcome();
+    const { msg } = appendAssistant(text, {
+      ...options,
+      messageId: messageId || newMessageId(),
+      regenerate: options.regenerate !== false,
+    });
+    return msg;
+  }
+
+  function finalizeStreaming(finalText, options = {}) {
+    hideWaiting();
+    const stream = state.stream;
+    const text =
+      finalText === undefined || finalText === null
+        ? stream
+          ? stream.text
+          : ""
+        : String(finalText);
+
+    if (!stream) {
+      // Nothing is streaming: an event without deltas still creates exactly one
+      // message, and a repeat updates that same message.
+      if (!text.trim()) return null;
+      return upsertAssistantMessage(options.messageId, text, options);
+    }
+
+    if (stream.frame) {
+      window.cancelAnimationFrame(stream.frame);
+      stream.frame = 0;
+    }
+    stream.done = true;
+    state.stream = null;
+
+    const msg = stream.msg;
+    const content = text.trim() ? text : stream.text;
+
+    if (!content.trim()) {
+      msg.remove();
+      if (state.lastAssistantEl === msg) state.lastAssistantEl = null;
+      scrollToBottom(false);
       return null;
     }
 
-    const msg = bubble.closest(".msg");
-    bubble.classList.remove("streaming");
-    if (text.trim()) {
-      bubble.innerHTML = renderMarkdown(text);
-      state.lastAssistantEl = msg;
-    } else if (msg) {
+    // If this round repeats the answer already on screen in the same turn,
+    // keep the existing bubble and drop the duplicate instead of showing it
+    // twice.
+    const duplicate = duplicatedAssistant(content, msg);
+    if (duplicate) {
       msg.remove();
-      if (state.lastAssistantEl === msg) state.lastAssistantEl = null;
+      state.lastAssistantEl = duplicate;
+      setAssistantBody(duplicate, content);
+      scrollToBottom(false);
+      return duplicate;
     }
 
-    state.streamingEl = null;
-    state.streamingText = "";
+    // Finalise the same element that streamed; no second body is ever added.
+    setAssistantBody(msg, content);
     scrollToBottom(false);
     return msg;
   }
 
   function addMessageMeta(msg, text) {
     if (!msg || !text) return;
-    const main = msg.querySelector(".msg-main");
-    if (!main) return;
-    const meta = document.createElement("div");
-    meta.className = "msg-meta";
-    meta.textContent = text;
-    main.appendChild(meta);
+    const meta = ensureMessageMeta(msg, null);
+    if (!meta) return;
+    let stats = meta.querySelector(".msg-stats");
+    if (!stats) {
+      stats = document.createElement("span");
+      stats.className = "msg-stats";
+      meta.appendChild(stats);
+    }
+    stats.textContent = text;
   }
 
   function appendToolRow(name, args) {
+    hideWaiting();
     const row = document.createElement("div");
     row.className = "tool-row";
 
@@ -626,13 +1238,13 @@
 
   function setRunning(running) {
     state.running = Boolean(running);
-    if (els.sendBtn) els.sendBtn.disabled = state.running;
     if (els.stopBtn) els.stopBtn.disabled = !state.running;
     if (els.messageInput) {
       els.messageInput.placeholder = state.running
         ? "The agent is working… press Stop to interrupt"
-        : "Ask Owlet…";
+        : "Ask Owlet… (attach an image with the paperclip)";
     }
+    updateComposerState();
   }
 
   function setAgentStatus(status, message) {
@@ -964,7 +1576,7 @@
       draft.type = "button";
       draft.className = "btn btn-ghost small row-action";
       draft.textContent = "Draft";
-      draft.title = "Draft this assignment with the local model, then review it";
+      draft.title = "Draft this assignment with the configured model, then review it";
       draft.addEventListener("click", () => openDraft(assignment.id));
       row.appendChild(draft);
     }
@@ -1112,7 +1724,7 @@
         state.conversationId = response.conversation_id;
         state.conversationStarted = true;
         setText(els.chatTitle, truncate(`Draft: ${name}`, 70));
-        setText(els.chatSubtitle, "Drafting · qwen3:8b · nothing is submitted");
+        setText(els.chatSubtitle, `Drafting · ${modelName()} · nothing is submitted`);
         setRunning(true);
         closeDraft();
         showToast("Drafting started. Approve any overwrite the agent asks for.");
@@ -1451,15 +2063,58 @@
 
   function updateOllama(ollama) {
     if (!ollama) return;
-    if (!ollama.reachable) {
+    state.ollama = ollama;
+    const model = ollama.model || modelName();
+    if (ollama.reachable === false) {
       setBadge(els.modelBadge, "Ollama offline", "bad", ollama.error || "Ollama is not reachable");
-    } else if (!ollama.installed) {
-      setBadge(els.modelBadge, `${ollama.model} missing`, "warn", ollama.error || "Model not installed");
+    } else if (ollama.installed === false) {
+      setBadge(els.modelBadge, `${model} missing`, "warn", ollama.error || "Model not installed");
     } else {
       const latency = ollama.latency_ms ? ` · ${ollama.latency_ms} ms` : "";
-      setBadge(els.modelBadge, ollama.model, "ok", `Ollama ready${latency}`);
+      const vision = ollama.vision === false ? " · no vision" : "";
+      setBadge(els.modelBadge, model, "ok", `Ollama ready${latency}${vision}`);
     }
-    setText(els.modelMeta, `${ollama.model || "qwen3:8b"} · local${ollama.reachable ? "" : " · offline"}`);
+    setText(els.brandModel, model);
+    const caps = [];
+    if (ollama.vision) caps.push("vision");
+    if (ollama.thinking) caps.push("thinking");
+    setText(
+      els.modelMeta,
+      `${model} · ${ollama.remote ? "remote" : "local"}${
+        ollama.reachable === false ? " · offline" : ""
+      }${caps.length ? ` · ${caps.join(" + ")}` : ""}`
+    );
+    updateModelNotice(ollama);
+  }
+
+  function updateModelNotice(ollama) {
+    if (!els.modelNotice) return;
+    if (ollama.reachable === false) {
+      els.modelNotice.classList.remove("hidden");
+      setText(els.modelNoticeTitle, "Ollama is not running");
+      setText(
+        els.modelNoticeBody,
+        ollama.error ||
+          (ollama.remote
+            ? "Check that Ollama is running on the Tailscale peer, then reload this page."
+            : "Start the Ollama app, then reload this page. Nothing leaves your laptop.")
+      );
+      setText(els.modelNoticeCommand, "ollama serve");
+      return;
+    }
+    if (ollama.installed === false) {
+      els.modelNotice.classList.remove("hidden");
+      setText(els.modelNoticeTitle, `${ollama.model} is not installed`);
+      setText(
+        els.modelNoticeBody,
+        ollama.remote
+          ? "Pull the model once on the Tailscale peer. It is a large download, but it only happens once."
+          : "Pull the model once in a terminal. It is a large download, but it only happens once."
+      );
+      setText(els.modelNoticeCommand, `ollama pull ${ollama.model}`);
+      return;
+    }
+    els.modelNotice.classList.add("hidden");
   }
 
   function updateBrowser(browser) {
@@ -1671,6 +2326,443 @@
     }
   }
 
+  // ---------- conversations ----------
+
+  function renderConversations(rows) {
+    state.conversations = Array.isArray(rows) ? rows : [];
+    setCount(els.chatCount, state.conversations.length);
+    if (!els.conversationList) return;
+    els.conversationList.replaceChildren();
+    if (!state.conversations.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No conversations yet. Ask something to start one.";
+      els.conversationList.appendChild(empty);
+      return;
+    }
+    state.conversations.forEach((row) =>
+      els.conversationList.appendChild(conversationRow(row))
+    );
+  }
+
+  function conversationRow(row) {
+    const wrap = document.createElement("div");
+    wrap.className = "conv-row";
+    wrap.dataset.id = String(row.id);
+    if (row.id === state.conversationId) wrap.classList.add("active");
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "conv-item";
+    open.title = row.title || "Conversation";
+
+    const title = document.createElement("span");
+    title.className = "conv-title";
+    title.textContent = row.title || "Untitled conversation";
+
+    const meta = document.createElement("span");
+    meta.className = "conv-meta";
+    const count = Number(row.message_count) || 0;
+    meta.textContent = [count ? plural(count, "message") : "empty", relativeTime(row.updated_at)]
+      .filter(Boolean)
+      .join(" · ");
+
+    open.appendChild(title);
+    open.appendChild(meta);
+    open.addEventListener("click", () => openConversation(Number(row.id)));
+
+    const actions = document.createElement("div");
+    actions.className = "conv-actions";
+
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "icon-btn conv-action";
+    rename.dataset.act = "rename";
+    rename.title = "Rename conversation";
+    rename.setAttribute("aria-label", `Rename ${row.title || "conversation"}`);
+    rename.textContent = "✎";
+    rename.addEventListener("click", () => renameConversation(Number(row.id)));
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-btn conv-action";
+    remove.dataset.act = "delete";
+    remove.title = "Delete conversation";
+    remove.setAttribute("aria-label", `Delete ${row.title || "conversation"}`);
+    remove.textContent = "🗑";
+    remove.addEventListener("click", () => deleteConversation(Number(row.id)));
+
+    actions.appendChild(rename);
+    actions.appendChild(remove);
+    wrap.appendChild(open);
+    wrap.appendChild(actions);
+    return wrap;
+  }
+
+  async function refreshConversations() {
+    try {
+      const data = await api("/api/conversations");
+      renderConversations(data.conversations);
+    } catch (_) {
+      /* the list is convenience only; the chat itself still works */
+    }
+  }
+
+  function renderHistory(messages) {
+    if (!els.messages) return;
+    els.messages.replaceChildren();
+    state.lastAssistantEl = null;
+    state.lastUserMessageEl = null;
+    state.lastUserText = "";
+    resetStream();
+    state.pendingTools = [];
+    hideWaiting();
+
+    const rows = (Array.isArray(messages) ? messages : []).filter(
+      (row) => row && (row.role === "user" || row.role === "assistant")
+    );
+    let lastAssistant = null;
+    let lastRole = null;
+    let shown = 0;
+    rows.forEach((row) => {
+      const content = String(row.content || "");
+      const messageId = row.id !== undefined && row.id !== null ? `db-${row.id}` : undefined;
+      if (row.role === "user") {
+        appendUser(content, row.images || [], row.created_at, messageId);
+        lastRole = "user";
+        shown += 1;
+      } else if (content.trim()) {
+        lastAssistant = appendAssistant(content, {
+          createdAt: row.created_at,
+          messageId,
+        }).msg;
+        lastRole = "assistant";
+        shown += 1;
+      }
+    });
+
+    if (!shown) {
+      restoreWelcome();
+      return;
+    }
+    if (lastAssistant && lastRole === "assistant") {
+      clearRegenerateActions();
+      messageActions(lastAssistant, { regenerate: true });
+    }
+    scrollToBottom(true);
+  }
+
+  async function openConversation(conversationId) {
+    if (state.running) {
+      showToast("Stop the agent before switching conversations.");
+      return;
+    }
+    const row = state.conversations.find((item) => item.id === conversationId);
+    if (state.conversationId === conversationId && state.conversationStarted) return;
+
+    state.conversationId = conversationId;
+    state.conversationStarted = true;
+    state.lastUserText = "";
+    clearAttachments();
+    hideWaiting();
+    setText(els.chatTitle, row?.title || "Conversation");
+    setText(els.chatSubtitle, `${modelName()} · loading history…`);
+    if (els.messages) {
+      els.messages.replaceChildren();
+      const loading = document.createElement("p");
+      loading.className = "empty";
+      loading.textContent = "Loading messages…";
+      els.messages.appendChild(loading);
+    }
+    renderConversations(state.conversations);
+    updateScrollButton();
+
+    try {
+      const data = await api(
+        `/api/conversations/${encodeURIComponent(conversationId)}/messages`
+      );
+      if (state.conversationId !== conversationId) return;
+      renderHistory(data.messages);
+      setText(
+        els.chatSubtitle,
+        `${modelName()} · ${plural((data.messages || []).length, "message")}`
+      );
+      setText(els.agentActivity, "Ready");
+    } catch (error) {
+      if (state.conversationId !== conversationId) return;
+      if (els.messages) els.messages.replaceChildren();
+      appendError(error.message);
+      setText(els.chatSubtitle, "Conversation unavailable");
+    }
+  }
+
+  async function renameConversation(conversationId) {
+    const row = state.conversations.find((item) => item.id === conversationId);
+    const proposed = window.prompt("Rename this conversation", row?.title || "");
+    if (proposed === null) return;
+    const title = proposed.trim().slice(0, 120);
+    if (!title) {
+      showToast("A conversation needs a name.", "bad");
+      return;
+    }
+    try {
+      const result = await api(
+        `/api/conversations/${encodeURIComponent(conversationId)}`,
+        { method: "PATCH", body: { title } }
+      );
+      const updated = result?.conversation;
+      if (updated) {
+        state.conversations = state.conversations.map((item) =>
+          item.id === updated.id ? { ...item, ...updated } : item
+        );
+        renderConversations(state.conversations);
+        if (state.conversationId === conversationId) setText(els.chatTitle, updated.title);
+      }
+      showToast("Conversation renamed.", "ok");
+    } catch (error) {
+      showToast(error.message, "bad");
+    }
+  }
+
+  async function deleteConversation(conversationId) {
+    if (state.running) {
+      showToast("Stop the agent before deleting a conversation.");
+      return;
+    }
+    const row = state.conversations.find((item) => item.id === conversationId);
+    const label = row?.title || "this conversation";
+    if (!window.confirm(`Delete “${label}”? Its messages and attached images are removed.`)) {
+      return;
+    }
+    try {
+      await api(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+        method: "DELETE",
+      });
+      state.conversations = state.conversations.filter((item) => item.id !== conversationId);
+      renderConversations(state.conversations);
+      if (state.conversationId === conversationId) newChat();
+      showToast("Conversation deleted.", "ok");
+    } catch (error) {
+      showToast(error.message, "bad");
+    }
+  }
+
+  // ---------- image attachments ----------
+
+  const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+  const MAX_IMAGE_DIMENSION = 1600;
+  let dragDepth = 0;
+
+  function attachmentBytes(dataUrl) {
+    const comma = String(dataUrl).indexOf(",");
+    if (comma < 0) return 0;
+    return Math.floor(((dataUrl.length - comma - 1) * 3) / 4);
+  }
+
+  function imageElement(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () =>
+          reject(new Error(`${file.name || "That image"} could not be opened.`));
+        img.src = String(reader.result || "");
+      };
+      reader.onerror = () =>
+        reject(new Error(`${file.name || "That image"} could not be read.`));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function loadImageFile(file) {
+    if (typeof createImageBitmap === "function") {
+      return createImageBitmap(file).catch(() => imageElement(file));
+    }
+    return imageElement(file);
+  }
+
+  function scaledCanvas(source) {
+    const width = source.width || source.naturalWidth || 0;
+    const height = source.height || source.naturalHeight || 0;
+    if (!width || !height) throw new Error("That image has no readable size.");
+    const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("This browser could not prepare the image.");
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  }
+
+  async function prepareAttachment(file) {
+    if (!IMAGE_MIME.has(file.type)) {
+      throw new Error("Attach PNG, JPEG, WebP, or GIF images.");
+    }
+    const source = await loadImageFile(file);
+    const canvas = scaledCanvas(source);
+    const preferred =
+      file.type === "image/png" || file.type === "image/gif" ? "image/png" : "image/jpeg";
+    let dataUrl = canvas.toDataURL(preferred, 0.85);
+    // A photo stays under the byte limit more reliably as JPEG; only fall back
+    // for PNG/GIF input, where transparency may matter.
+    if (attachmentBytes(dataUrl) > maxImageBytes() && preferred !== "image/jpeg") {
+      dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+    }
+    const size = attachmentBytes(dataUrl);
+    if (!size) throw new Error("That image came out empty; try another file.");
+    if (size > maxImageBytes()) {
+      throw new Error(
+        `Each image must be under ${state.chatConfig?.max_image_mb || 8} MB after scaling.`
+      );
+    }
+    state.attachmentSeq += 1;
+    const mime = dataUrl.slice(5, dataUrl.indexOf(";")) || preferred;
+    return {
+      id: `att-${state.attachmentSeq}`,
+      name: file.name || `image-${state.attachmentSeq}`,
+      mime,
+      dataUrl,
+      size,
+      width: canvas.width,
+      height: canvas.height,
+    };
+  }
+
+  async function addAttachments(files) {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length) return;
+    const room = maxImages() - state.attachments.length;
+    if (room <= 0) {
+      showToast(`Attach at most ${maxImages()} images per message.`, "bad");
+      return;
+    }
+    if (list.length > room) {
+      showToast(`Only ${room} more image${room === 1 ? "" : "s"} can be attached.`);
+    }
+    for (const file of list.slice(0, room)) {
+      try {
+        const attachment = await prepareAttachment(file);
+        state.attachments.push(attachment);
+        renderAttachments();
+      } catch (error) {
+        showToast(error.message, "bad");
+      }
+    }
+    updateComposerState();
+  }
+
+  function removeAttachment(id) {
+    state.attachments = state.attachments.filter((item) => item.id !== id);
+    renderAttachments();
+    updateComposerState();
+  }
+
+  function clearAttachments() {
+    state.attachments = [];
+    if (els.imageInput) els.imageInput.value = "";
+    renderAttachments();
+  }
+
+  function renderAttachments() {
+    if (!els.attachments) return;
+    els.attachments.replaceChildren();
+    els.attachments.classList.toggle("hidden", !state.attachments.length);
+    state.attachments.forEach((attachment) => {
+      const item = document.createElement("div");
+      item.className = "attachment";
+      item.dataset.id = attachment.id;
+
+      const img = document.createElement("img");
+      img.src = attachment.dataUrl;
+      img.alt = attachment.name;
+      img.title = `${attachment.name} · ${attachment.width}×${attachment.height} · ${formatBytes(attachment.size)}`;
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "attachment-remove";
+      remove.title = `Remove ${attachment.name}`;
+      remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+      remove.textContent = "×";
+      remove.addEventListener("click", () => removeAttachment(attachment.id));
+
+      const meta = document.createElement("span");
+      meta.className = "attachment-meta";
+      meta.textContent = formatBytes(attachment.size);
+
+      item.appendChild(img);
+      item.appendChild(meta);
+      item.appendChild(remove);
+      els.attachments.appendChild(item);
+    });
+  }
+
+  function updateComposerState() {
+    if (!els.sendBtn) return;
+    const hasContent = Boolean(els.messageInput?.value.trim()) || state.attachments.length > 0;
+    els.sendBtn.disabled = state.running || !hasContent;
+  }
+
+  function hasFiles(event) {
+    const types = event.dataTransfer?.types;
+    return Boolean(types && Array.from(types).includes("Files"));
+  }
+
+  function showDrop(show) {
+    els.dropOverlay?.classList.toggle("hidden", !show);
+  }
+
+  function wireAttachments() {
+    els.attachBtn?.addEventListener("click", () => els.imageInput?.click());
+
+    els.imageInput?.addEventListener("change", () => {
+      if (els.imageInput.files?.length) addAttachments(els.imageInput.files);
+      els.imageInput.value = "";
+    });
+
+    const panel = els.chatPanel;
+    if (!panel) return;
+
+    panel.addEventListener("dragenter", (event) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragDepth += 1;
+      showDrop(true);
+    });
+
+    panel.addEventListener("dragover", (event) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      showDrop(true);
+    });
+
+    panel.addEventListener("dragleave", () => {
+      if (!dragDepth) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) showDrop(false);
+    });
+
+    panel.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dragDepth = 0;
+      showDrop(false);
+      addAttachments(event.dataTransfer?.files);
+    });
+
+    panel.addEventListener("paste", (event) => {
+      const files = Array.from(event.clipboardData?.files || []).filter((file) =>
+        IMAGE_MIME.has(file.type)
+      );
+      if (!files.length) return;
+      // Text that happens to come with a copied image should not be swallowed.
+      if (event.clipboardData?.getData("text")) return;
+      event.preventDefault();
+      addAttachments(files);
+    });
+  }
+
   // ---------- chat actions ----------
 
   function autosize() {
@@ -1681,48 +2773,164 @@
   }
 
   async function sendMessage(rawText) {
-    const text = String(rawText ?? "").trim();
-    if (!text) return;
-    if (state.running) {
+    const typed = String(rawText ?? "").trim();
+    const attachments = state.attachments.slice();
+    if (!typed && !attachments.length) return;
+    // One submission, one generation request. `sending` closes the gap between
+    // the click/Enter handler firing and the POST actually being in flight.
+    if (state.running || state.sending) {
       showToast("The agent is already working. Stop it or wait for it to finish.");
       return;
     }
-    if (isResetCommand(text)) {
+    if (typed && !attachments.length && isResetCommand(typed)) {
       resetSavedData();
       return;
     }
-    if (text.length > 8000) {
+    if (typed.length > 8000) {
       showToast("That message is too long (maximum 8000 characters).", "bad");
       return;
     }
 
-    appendUser(text);
+    // An image-only turn still needs visible text; the backend stores the same
+    // sentence, so a reloaded history matches what was just shown.
+    const text = typed || IMAGE_ONLY_TEXT;
+    const previews = attachments.map((attachment) => ({
+      url: attachment.dataUrl,
+      name: attachment.name,
+    }));
+
+    state.sending = true;
+    appendUser(text, previews);
+    clearAttachments();
     if (els.messageInput) {
       els.messageInput.value = "";
       autosize();
     }
     if (!state.conversationStarted || state.conversationId === null) {
       setText(els.chatTitle, truncate(text, 70));
-      setText(els.chatSubtitle, "Local conversation · qwen3:8b");
+      setText(els.chatSubtitle, `Local conversation · ${modelName()}`);
     }
     state.conversationStarted = true;
     setRunning(true);
-    setText(els.agentActivity, "Starting…");
+    updateComposerState();
+    setText(
+      els.agentActivity,
+      attachments.length
+        ? `Sending ${plural(attachments.length, "image")} to ${modelName()}…`
+        : "Starting…"
+    );
+    showWaiting(`Thinking with ${modelName()}…`);
 
     try {
       const response = await api("/api/chat", {
         method: "POST",
-        body: { message: text, conversation_id: state.conversationId },
+        body: {
+          message: typed,
+          conversation_id: state.conversationId,
+          images: attachments.map((attachment) => ({
+            name: attachment.name,
+            mime: attachment.mime,
+            data: attachment.dataUrl.split(",")[1] || "",
+          })),
+        },
       });
       state.conversationId = response.conversation_id;
+      refreshConversations();
     } catch (error) {
+      hideWaiting();
       setRunning(false);
+      updateComposerState();
       if (error.status === 409) {
         showToast(error.message);
       } else {
         appendError(error.message);
       }
       setText(els.agentActivity, "Ready");
+    } finally {
+      state.sending = false;
+    }
+  }
+
+  function clearAfterLastUser() {
+    if (!state.lastUserMessageEl) return;
+    let node = state.lastUserMessageEl.nextSibling;
+    while (node) {
+      const next = node.nextSibling;
+      node.remove();
+      node = next;
+    }
+    state.lastAssistantEl = null;
+    resetStream();
+    state.pendingTools = [];
+    hideWaiting();
+    updateScrollButton();
+  }
+
+  async function regenerateLast() {
+    if (state.running) {
+      showToast("The agent is already working.");
+      return;
+    }
+    const conversationId = state.conversationId;
+    if (conversationId === null) {
+      showToast("Ask a question first.");
+      return;
+    }
+    if (!state.lastUserMessageEl) {
+      showToast("There is no question to regenerate yet.");
+      return;
+    }
+
+    clearAfterLastUser();
+    setRunning(true);
+    updateComposerState();
+    setText(els.agentActivity, `Regenerating with ${modelName()}…`);
+    showWaiting(`Regenerating with ${modelName()}…`);
+
+    try {
+      await api("/api/chat/regenerate", {
+        method: "POST",
+        body: { conversation_id: conversationId },
+      });
+      refreshConversations();
+    } catch (error) {
+      hideWaiting();
+      setRunning(false);
+      updateComposerState();
+      appendError(error.message);
+      setText(els.agentActivity, "Ready");
+    }
+  }
+
+  async function copyMessage(msg) {
+    const bubble = msg?.querySelector(".bubble");
+    if (!bubble) return;
+    const text = bubble.innerText || bubble.textContent || "";
+    if (!text.trim()) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        throw new Error("clipboard unavailable");
+      }
+      showToast("Copied to clipboard.", "ok");
+    } catch (_) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.top = "-1000px";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand("copy");
+        showToast("Copied to clipboard.", "ok");
+      } catch (__) {
+        showToast("Copy failed — select the text and copy it manually.", "bad");
+      } finally {
+        area.remove();
+      }
     }
   }
 
@@ -1745,15 +2953,20 @@
       return;
     }
     state.conversationId = null;
+    state.conversationStarted = false;
     state.lastAssistantEl = null;
+    state.lastUserMessageEl = null;
     state.lastUserText = "";
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
+    hideWaiting();
+    clearAttachments();
     restoreWelcome();
+    renderConversations(state.conversations);
     setText(els.chatTitle, defaultChatTitle);
     setText(els.chatSubtitle, defaultChatSubtitle);
     setText(els.agentActivity, "Ready");
+    updateComposerState();
     els.messageInput?.focus();
   }
 
@@ -1781,20 +2994,23 @@
     state.conversationId = null;
     state.conversationStarted = false;
     state.lastAssistantEl = null;
+    state.lastUserMessageEl = null;
     state.lastUserText = "";
-    state.streamingEl = null;
-    state.streamingText = "";
+    resetStream();
     state.pendingTools = [];
     state.approvals.clear();
     state.currentApprovalId = null;
     state.files = { workspace: [], generated: [] };
 
+    hideWaiting();
+    clearAttachments();
     hideApprovalModal();
     renderApprovalBar();
     renderCourses([]);
     renderAssignments([]);
     renderFiles();
     renderActivity([]);
+    renderConversations([]);
     restoreWelcome();
 
     setText(els.chatTitle, defaultChatTitle);
@@ -1851,6 +3067,9 @@
         if (data) {
           updateBrowser(data.browser);
           renderSync(data.sync);
+          if (data.ollama) updateOllama(data.ollama);
+          if (data.chat) state.chatConfig = { ...state.chatConfig, ...data.chat };
+          if (Array.isArray(data.conversations)) renderConversations(data.conversations);
           if (data.moodle_url) {
             state.moodleUrl = data.moodle_url;
             if (!els.moodleUrl.value) els.moodleUrl.value = data.moodle_url;
@@ -1865,25 +3084,82 @@
       }
 
       case "user_message": {
+        const target = data?.conversation_id;
+        if (target && state.conversationId !== null && target !== state.conversationId) {
+          refreshConversations();
+          break;
+        }
+        const messageId = data?.message_id || null;
+        const shown = messageId ? messageById(messageId) : null;
         const alreadyShown =
-          state.lastUserText === message &&
-          els.messages?.lastElementChild?.classList.contains("user");
-        if (!alreadyShown) appendUser(message);
+          Boolean(shown) ||
+          (state.lastUserText === message &&
+            state.lastUserMessageEl &&
+            els.messages?.contains(state.lastUserMessageEl));
+        if (!alreadyShown) {
+          appendUser(message, data?.images || [], undefined, messageId);
+        } else if (messageId && state.lastUserMessageEl) {
+          // The optimistic bubble was already drawn: adopt the server id so a
+          // replay of this event can never add it a second time.
+          state.lastUserMessageEl.dataset.messageId = messageId;
+        }
         state.lastUserText = message;
+        refreshConversations();
+        break;
+      }
+
+      case "regenerate": {
+        if (data?.conversation_id && state.conversationId !== null && data.conversation_id !== state.conversationId) {
+          refreshConversations();
+          break;
+        }
+        clearAfterLastUser();
+        setRunning(true);
+        setText(els.agentActivity, `Regenerating with ${modelName()}…`);
+        showWaiting(`Regenerating with ${modelName()}…`);
+        refreshConversations();
+        break;
+      }
+
+      case "conversation_renamed": {
+        const row = data?.conversation;
+        if (row) {
+          state.conversations = state.conversations.map((item) =>
+            item.id === row.id ? { ...item, ...row } : item
+          );
+          renderConversations(state.conversations);
+          if (state.conversationId === row.id) setText(els.chatTitle, row.title);
+        }
+        break;
+      }
+
+      case "conversation_deleted": {
+        const removed = Number(data?.conversation_id);
+        if (Number.isFinite(removed)) {
+          state.conversations = state.conversations.filter((item) => item.id !== removed);
+          renderConversations(state.conversations);
+          if (state.conversationId === removed) newChat();
+        }
         break;
       }
 
       case "assistant_delta": {
-        if (!message) break;
-        const bubble = ensureStreaming();
-        state.streamingText += message;
-        bubble.textContent = state.streamingText;
-        scrollToBottom(false);
+        appendAssistantDelta(message, data?.message_id || null);
         break;
       }
 
       case "assistant_message": {
-        finalizeStreaming(message);
+        const messageId = data?.message_id || null;
+        const stream = state.stream;
+        if (stream && !stream.done && (!messageId || stream.id === messageId)) {
+          // The final event for the round that is already on screen: finalise
+          // that exact element. This is the end of the message, not a new one.
+          finalizeStreaming(message, { messageId: stream.id });
+          break;
+        }
+        if (stream) finalizeStreaming(undefined, { messageId: stream.id });
+        // No live stream (or a replayed event): update by id, or create once.
+        upsertAssistantMessage(messageId, message);
         break;
       }
 
@@ -2002,25 +3278,28 @@
       }
 
       case "done": {
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         setRunning(false);
         if (data) {
           const parts = [];
           if (data.steps) parts.push(plural(data.steps, "model round"));
           if (data.tool_calls) parts.push(plural(data.tool_calls, "tool call"));
-          addMessageMeta(state.lastAssistantEl, parts.join(" · "));
+          const target = (data.message_id && messageById(data.message_id)) || state.lastAssistantEl;
+          addMessageMeta(target, parts.join(" · "));
         }
         setText(els.agentActivity, "Ready");
+        refreshConversations();
         scheduleDataRefresh();
         break;
       }
 
       case "stopped": {
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         appendNotice("Stopped. You can ask a smaller next step.");
         setRunning(false);
         setText(els.agentActivity, "Stopped");
         addActivity({ kind: "stopped", level: "info", message: message || "Agent stopped", created_at: event.ts }, true);
+        refreshConversations();
         break;
       }
 
@@ -2049,7 +3328,7 @@
 
       case "error": {
         const wasRunning = state.running;
-        finalizeStreaming();
+        finalizeStreaming(undefined, { messageId: data?.message_id || undefined });
         if (wasRunning) appendError(message || "Something went wrong.");
         else showToast(message || "Something went wrong.", "bad");
         setText(els.agentActivity, "Error — see the chat");
@@ -2074,6 +3353,8 @@
       if (state.sseFailed) {
         state.sseFailed = false;
         showToast("Reconnected to the local server.", "ok");
+        // Anything may have changed while the stream was down.
+        hydrate().catch(() => {});
       }
     };
 
@@ -2101,14 +3382,17 @@
   async function hydrate() {
     try {
       const snapshot = await api("/api/state");
+      state.chatConfig = { ...state.chatConfig, ...(snapshot.chat || {}) };
       updateOllama(snapshot.ollama);
       updateBrowser(snapshot.browser);
       renderSync(snapshot.sync);
       renderCourses(snapshot.courses);
       renderAssignments(snapshot.assignments);
+      renderConversations(snapshot.conversations || []);
       state.files = snapshot.files || state.files;
       renderFiles();
       renderActivity(snapshot.activity);
+      updateComposerState();
 
       state.tools = snapshot.tools || [];
       setText(
@@ -2173,7 +3457,10 @@
       sendMessage(els.messageInput?.value);
     });
 
-    els.messageInput?.addEventListener("input", autosize);
+    els.messageInput?.addEventListener("input", () => {
+      autosize();
+      updateComposerState();
+    });
     els.messageInput?.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -2182,11 +3469,31 @@
     });
 
     els.messages?.addEventListener("click", (event) => {
+      const action = event.target.closest(".msg-action");
+      if (action) {
+        const msg = action.closest(".msg");
+        if (action.dataset.act === "copy") copyMessage(msg);
+        else if (action.dataset.act === "regenerate") regenerateLast();
+        return;
+      }
       const suggestion = event.target.closest(".suggestion");
       if (!suggestion) return;
       const prompt = suggestion.dataset.prompt;
       if (prompt) sendMessage(prompt);
     });
+
+    els.messages?.addEventListener("scroll", updateScrollButton, { passive: true });
+    els.scrollBtn?.addEventListener("click", () => {
+      if (els.messages) els.messages.scrollTop = els.messages.scrollHeight;
+      updateScrollButton();
+      els.messageInput?.focus();
+    });
+
+    // Both the sidebar and the chat header offer a New chat action.
+    document.querySelectorAll("[data-new-chat]").forEach((button) => {
+      button.addEventListener("click", newChat);
+    });
+    wireAttachments();
 
     els.stopBtn?.addEventListener("click", stopAgent);
     els.newChatBtn?.addEventListener("click", newChat);
@@ -2359,6 +3666,17 @@
     document.addEventListener("keydown", (event) => {
       // Escape closes the draft dialog only; the approval dialog stays blocking.
       if (event.key === "Escape" && state.draftId !== null && !state.currentApprovalId) closeDraft();
+
+      // Ctrl/Cmd+K focuses the composer from anywhere; Alt+N starts a new chat.
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        els.messageInput?.focus();
+        return;
+      }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        newChat();
+      }
     });
 
     document.addEventListener("visibilitychange", () => {

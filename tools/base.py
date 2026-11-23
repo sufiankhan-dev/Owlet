@@ -1,6 +1,6 @@
 """Tool contracts shared by every capability exposed to the model.
 
-Only tools registered here are visible to qwen3:8b. Handlers receive validated
+Only tools registered here are visible to the model. Handlers receive validated
 Pydantic arguments and must return JSON-serializable dicts. No handler may
 execute shell commands or touch paths outside the configured jail.
 """

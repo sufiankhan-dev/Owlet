@@ -33,7 +33,7 @@ class ScriptedLLM:
         self.calls: list[dict] = []
 
     async def health(self) -> dict:
-        return {"ok": True, "reachable": True, "model": "qwen3:8b", "installed": True}
+        return {"ok": True, "reachable": True, "model": "qwen3.5:9b", "installed": True}
 
     async def stream_chat(self, messages, **kwargs):
         self.calls.append({"messages": [dict(m) for m in messages]})
