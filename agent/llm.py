@@ -258,12 +258,67 @@ class OllamaService:
         should_stop: StopCheck | None = None,
         num_predict: int | None = None,
         temperature: float | None = None,
+        think: bool | None = None,
     ) -> LLMResult:
         """Stream a completion and accumulate text + tool calls.
 
         Ollama emits a complete tool call in one chunk; arguments arrive as a
         dict through the Python SDK. We still tolerate JSON-string arguments.
+
+        Thinking models can spend a whole round in the ``thinking`` channel and
+        leave ``content`` empty, which looks like a silent failure to the agent
+        loop. When thinking is on and a round returns neither text nor a tool
+        call, the same request is retried once with thinking disabled so the
+        answer arrives as normal text.
         """
+        think_mode = self.settings.ollama_think if think is None else think
+        result = await self._stream_once(
+            messages,
+            tools=tools,
+            on_delta=on_delta,
+            should_stop=should_stop,
+            num_predict=num_predict,
+            temperature=temperature,
+            think=think_mode,
+        )
+        if (
+            think_mode
+            and not result.cancelled
+            and not result.content
+            and not result.tool_calls
+        ):
+            logger.info(
+                "Thinking-enabled round returned no text or tool call (%s thinking chars); "
+                "retrying with thinking disabled",
+                len(result.thinking),
+            )
+            retry = await self._stream_once(
+                messages,
+                tools=tools,
+                on_delta=on_delta,
+                should_stop=should_stop,
+                num_predict=num_predict,
+                temperature=temperature,
+                think=False,
+            )
+            if retry.content or retry.tool_calls:
+                return retry
+            retry.thinking = retry.thinking or result.thinking
+            return retry
+        return result
+
+    async def _stream_once(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None = None,
+        on_delta: DeltaCallback | None = None,
+        should_stop: StopCheck | None = None,
+        num_predict: int | None = None,
+        temperature: float | None = None,
+        think: bool,
+    ) -> LLMResult:
+        """One streaming request to Ollama, with no retries."""
         options: dict[str, Any] = {
             "temperature": (
                 self.settings.ollama_temperature if temperature is None else temperature
@@ -283,8 +338,8 @@ class OllamaService:
         if tools:
             kwargs["tools"] = list(tools)
         # qwen3 defaults to thinking when the flag is omitted; force the
-        # configured mode so the UI and latency stay predictable.
-        kwargs["think"] = self.settings.ollama_think
+        # requested mode so the UI and latency stay predictable.
+        kwargs["think"] = think
 
         content_parts: list[str] = []
         thinking_parts: list[str] = []
