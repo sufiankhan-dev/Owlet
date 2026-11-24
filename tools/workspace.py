@@ -18,11 +18,13 @@ from app.security import PathJail, sanitize_component
 ASSIGNMENT_SUBDIRS = (
     "instructions",
     "attachments",
+    "reference_materials",
     "extracted",
     "explanations",
     "code",
     "documents",
     "pdfs",
+    "deliverables",
     "submission",
 )
 

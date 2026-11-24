@@ -127,6 +127,19 @@ def test_inputs_skip_text_already_in_assignment_md(tmp_path: Path) -> None:
     ]
 
 
+def test_reference_text_replaces_the_binary_in_the_input_list(tmp_path: Path) -> None:
+    jail = _jail(tmp_path)
+    base = tmp_path / "workspace" / "Course" / "Lab"
+    (base / "reference_materials").mkdir(parents=True)
+    (base / "extracted" / "references").mkdir(parents=True)
+    (base / "reference_materials" / "lab1.pdf").write_bytes(b"%PDF-1.4")
+    (base / "extracted" / "references" / "lab1.txt").write_text(
+        "LAB 1: normalize the relation.", encoding="utf-8"
+    )
+
+    assert input_files(jail, base) == ["Course/Lab/extracted/references/lab1.txt"]
+
+
 def test_size_limits_are_clamped_not_rejected() -> None:
     from tools.document_tools import ReadDocumentArgs
     from tools.pdf_tools import ReadPdfArgs
