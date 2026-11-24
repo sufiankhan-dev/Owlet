@@ -299,7 +299,7 @@ def load_settings() -> Settings:
         max_page_chars=_env_int("MAX_PAGE_CHARS", 14000, 2000, 100000),
         max_tool_result_chars=_env_int("MAX_TOOL_RESULT_CHARS", 8000, 1000, 50000),
         approval_timeout_s=_env_int("APPROVAL_TIMEOUT_S", 300, 30, 3600),
-        max_agent_iterations=_env_int("MAX_AGENT_ITERATIONS", 12, 1, 50),
+        max_agent_iterations=_env_int("MAX_AGENT_ITERATIONS", 20, 1, 50),
         sync_on_connect=_env_bool("SYNC_ON_CONNECT", True),
         due_soon_hours=due_soon_hours,
         due_urgent_hours=due_urgent_hours,

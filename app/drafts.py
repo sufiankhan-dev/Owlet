@@ -25,8 +25,8 @@ from app.security import PathJail, PathSecurityError
 
 logger = logging.getLogger(__name__)
 
-DRAFT_DIRS = ("code", "documents", "pdfs", "submission")
-INPUT_DIRS = ("instructions", "attachments", "extracted")
+DRAFT_DIRS = ("code", "documents", "pdfs", "deliverables", "submission")
+INPUT_DIRS = ("instructions", "attachments", "reference_materials", "extracted")
 REVIEW_FILE = "review.json"
 REVIEW_NOTE = "explanations/REVIEW.md"
 _INPUT_SUFFIXES = {".md", ".txt", ".pdf", ".docx", ".csv", ".json", ".py", ".sql", ".java", ".c", ".cpp"}
@@ -91,11 +91,21 @@ def input_files(jail: PathJail, base: Path) -> list[str]:
     except OSError:
         folded = ""
 
+    # When a reference's text was extracted, list the text instead of both the
+    # binary and its text; every extra read costs a slow model round.
+    reference_texts = {
+        path.stem
+        for path in (base / "extracted" / "references").glob("*.txt")
+        if path.is_file()
+    }
+
     paths = []
     for path in _iter_files(base, INPUT_DIRS):
         if path.suffix.lower() not in _INPUT_SUFFIXES:
             continue
-        if path.name == "metadata.json":
+        if path.name in {"metadata.json", "matches.json"}:
+            continue
+        if path.parent.name == "reference_materials" and path.stem in reference_texts:
             continue
         if folded and path.parent.name == "extracted":
             if path.name == "page.txt":
@@ -240,6 +250,7 @@ def write_review_note(base: Path, assignment_name: str, content: str) -> Path:
 def build_draft_request(row: dict[str, Any], inputs: list[str], workspace: str) -> str:
     """The user turn that starts a draft run. Kept short; files carry the detail."""
 
+    course_folder = workspace.rsplit("/", 1)[0] if "/" in workspace else workspace
     lines = [
         f'Draft my assignment "{row.get("name") or "Assignment"}"'
         + (f' for the course "{row["course_name"]}"' if row.get("course_name") else "")
@@ -248,16 +259,25 @@ def build_draft_request(row: dict[str, Any], inputs: list[str], workspace: str) 
     ]
     if row.get("due_text"):
         lines.append(f"Due (as Moodle shows it): {row['due_text']}")
+    if row.get("course_moodle_id"):
+        lines.append(f"Moodle course id: {row['course_moodle_id']}")
+    if row.get("course_url"):
+        lines.append(f"Moodle course URL: {row['course_url']}")
+    if row.get("url"):
+        lines.append(f"Assignment URL: {row['url']}")
+    lines.append(f"Course resources folder: {course_folder}/course_resources")
     if inputs:
-        lines.append("Saved instruction and teacher files to read first:")
+        lines.append("Saved instruction, teacher, and reference files to read first:")
         lines.extend(f"- {path}" for path in inputs)
         lines.append(
-            "The teacher's attachments are already downloaded and their text is included "
-            "in these files. Do not open Moodle or download anything; read these, then "
-            "create the deliverables."
+            "These files are already downloaded, including any course resource that matched "
+            "this assignment. Read them, then create the deliverables. If the brief names a "
+            "lab/task that is missing, call open_assignment once with the course id above; do "
+            "not download files by hand."
         )
     else:
         lines.append(
-            "No instructions are saved yet. Open the assignment in Moodle to read them."
+            "No instructions are saved yet. Call open_assignment once with the course id above "
+            "to read the assignment and match its course resources."
         )
     return "\n".join(lines)

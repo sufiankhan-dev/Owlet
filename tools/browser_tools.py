@@ -11,7 +11,7 @@ import difflib
 import logging
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import Field
 
@@ -35,6 +35,15 @@ from tools.base import (
     ToolError,
     ToolRegistry,
     ToolSpec,
+)
+from tools.course_resources import (
+    copy_matches_to_assignment,
+    course_resource_paths,
+    ensure_course_resources,
+    find_assignment_section,
+    load_manifest,
+    match_resources,
+    write_reference_extracts,
 )
 from tools.workspace import (
     assignment_workspace,
@@ -63,13 +72,37 @@ class NavigateArgs(StrictArgs):
 
 
 class OpenCourseArgs(StrictArgs):
-    course_name: str = Field(description="Course name as shown in Moodle, or a distinctive part of it.")
+    course_name: str = Field(
+        default="",
+        description="Course name as shown in Moodle, or a distinctive part of it.",
+    )
+    course_id: str = Field(
+        default="",
+        description=(
+            "Moodle course id (the number in course/view.php?id=...). Prefer this when known: "
+            "it avoids picking the wrong course when names are similar."
+        ),
+    )
+    scan_resources: bool = Field(
+        default=True,
+        description=(
+            "Scan every course section and download teacher files into the course's "
+            "course_resources folder. Leave true unless the user only wants the assignment list."
+        ),
+    )
+    refresh_resources: bool = Field(
+        default=False,
+        description="Ignore the cached resource manifest and rescan the course now.",
+    )
 
 
 class ListAssignmentsArgs(StrictArgs):
     course_name: str = Field(
         default="",
         description="Course to inspect. Leave empty to use the currently open course.",
+    )
+    course_id: str = Field(
+        default="", description="Moodle course id; preferred over the name when both are known."
     )
     include_submitted: bool = Field(
         default=False,
@@ -82,6 +115,19 @@ class OpenAssignmentArgs(StrictArgs):
     course_name: str = Field(
         default="",
         description="Course containing the assignment. Leave empty to use the open course.",
+    )
+    course_id: str = Field(
+        default="", description="Moodle course id; preferred over the name when both are known."
+    )
+    scan_resources: bool = Field(
+        default=True,
+        description=(
+            "Scan the course for teacher files and copy the ones that match this assignment "
+            "into reference_materials/. Leave true unless the user asks not to."
+        ),
+    )
+    refresh_resources: bool = Field(
+        default=False, description="Rescan the course resources instead of using the cache."
     )
 
 
@@ -135,6 +181,84 @@ def _match_item(query: str, items: list[dict[str, Any]]) -> tuple[dict[str, Any]
     if len(candidates) == 1:
         return candidates[0], []
     return None, (candidates or items[:5])
+
+
+def _course_id_from_url(url: str) -> str:
+    """Moodle course id from a ``course/view.php?id=...`` URL."""
+
+    try:
+        return str(parse_qs(urlparse(url or "").query).get("id", [""])[0]).strip()
+    except Exception:
+        return ""
+
+
+def _activity_id_from_url(url: str) -> str:
+    """Moodle activity id from a ``mod/.../view.php?id=...`` URL."""
+
+    return _course_id_from_url(url)
+
+
+def _resolve_course(
+    courses: list[dict[str, Any]],
+    course_name: str,
+    course_id: str,
+    *,
+    db_courses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Pick a course by Moodle id first, then by name.
+
+    A course id is exact and cannot be confused with a similar course name, so
+    it is always preferred. The database copy is a fallback for a course that
+    is no longer on the dashboard but was synced earlier.
+    """
+
+    wanted_id = str(course_id or "").strip()
+    if wanted_id:
+        for course in courses:
+            if str(course.get("course_id") or "").strip() == wanted_id:
+                return course
+        for row in db_courses or []:
+            if str(row.get("moodle_id") or "").strip() == wanted_id and row.get("url"):
+                return {
+                    "name": row.get("name") or f"Course {wanted_id}",
+                    "url": row["url"],
+                    "course_id": wanted_id,
+                }
+        raise ToolError(
+            f"No course with Moodle id {wanted_id!r} is visible. Call list_courses to see "
+            "the ids, or pass the course name instead."
+        )
+
+    match, candidates = _match_item(course_name, courses)
+    if match is None:
+        names = [c["name"] for c in candidates]
+        raise ToolError(
+            f"Course {course_name!r} was not found or is ambiguous. "
+            f"Candidates: {names}. Ask the user which one they mean, or pass its course_id."
+        )
+    return match
+
+
+async def _ensure_course_resources(
+    ctx: ToolContext,
+    *,
+    refresh: bool = False,
+    scan: bool = True,
+) -> dict[str, Any] | None:
+    """Scan/download the open course's resources without failing the whole call."""
+
+    if not scan:
+        return None
+    course = ctx.current_course()
+    if not course or not course.get("url"):
+        return None
+    try:
+        return await ensure_course_resources(ctx, course, refresh=refresh)
+    except ToolError as exc:
+        # The assignment itself may still be readable; report the scan problem
+        # instead of aborting the workflow.
+        ctx.log("reading", f"Course resource scan failed: {exc.message}", {"error": True})
+        return {"ok": False, "error": exc.message, "manifest_path": ""}
 
 
 def _summarize_snapshot(snapshot: dict[str, Any], *, max_text: int = 6000) -> dict[str, Any]:
@@ -342,16 +466,22 @@ async def _load_courses(ctx: ToolContext) -> list[dict[str, Any]]:
 
 
 async def _open_course(
-    ctx: ToolContext, course_name: str
-) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    ctx: ToolContext,
+    course_name: str = "",
+    course_id: str = "",
+    *,
+    scan_resources: bool = True,
+    refresh_resources: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
     courses = await _load_courses(ctx)
-    match, candidates = _match_item(course_name, courses)
-    if match is None:
-        names = [c["name"] for c in candidates]
-        raise ToolError(
-            f"Course {course_name!r} was not found or is ambiguous. "
-            f"Candidates: {names}. Ask the user which one they mean."
+    try:
+        match = _resolve_course(
+            courses, course_name, course_id, db_courses=ctx.db.list_courses()
         )
+    except ToolError:
+        raise
+    if course_id and not match.get("course_id"):
+        match["course_id"] = str(course_id).strip()
 
     ctx.check_cancel()
     ctx.log("navigate", f"Opening course: {match['name']}", {"url": match["url"]})
@@ -379,7 +509,24 @@ async def _open_course(
     ctx.state["current_assignments"] = assignments
     ctx.state.pop("current_assignment", None)
     ctx.log("reading", f"Read course page: {match['name']}")
-    return match, snapshot, assignments
+
+    resources = None
+    if scan_resources:
+        try:
+            resources = await ensure_course_resources(
+                ctx,
+                ctx.state["current_course"],
+                refresh=refresh_resources,
+            )
+        except ToolError as exc:
+            ctx.log(
+                "reading",
+                f"Course resource scan failed: {exc.message}",
+                {"error": True},
+            )
+            resources = {"ok": False, "error": exc.message, "manifest_path": ""}
+
+    return match, snapshot, assignments, resources
 
 
 def _require_browser(ctx: ToolContext) -> None:
@@ -471,28 +618,59 @@ async def list_courses(ctx: ToolContext, _args: EmptyArgs) -> dict[str, Any]:
 
 
 async def open_course(ctx: ToolContext, args: OpenCourseArgs) -> dict[str, Any]:
-    course, snapshot, assignments = await _open_course(ctx, args.course_name)
+    course, snapshot, assignments, resources = await _open_course(
+        ctx,
+        args.course_name,
+        args.course_id,
+        scan_resources=args.scan_resources,
+        refresh_resources=args.refresh_resources,
+    )
     pending = [a for a in assignments if a.get("pending")]
+    message = (
+        f"Opened {course['name']}. Found {len(assignments)} assignment(s), "
+        f"{len(pending)} pending. Due dates are shown exactly as Moodle displays them."
+    )
+    if resources:
+        if resources.get("ok"):
+            message += (
+                f" Course resources: {resources.get('downloaded', 0)} downloaded, "
+                f"{resources.get('reused', 0)} reused, {resources.get('failed', 0)} failed."
+            )
+        else:
+            message += f" Course resource scan problem: {resources.get('error', '')}"
     return {
         "ok": True,
-        "course": {"name": course["name"], "url": course["url"]},
+        "course": {
+            "name": course["name"],
+            "url": course["url"],
+            "course_id": course.get("course_id", ""),
+        },
         "page": _summarize_snapshot(snapshot),
         "assignments": [_assignment_payload(a) for a in assignments],
         "pending_count": len(pending),
-        "message": (
-            f"Opened {course['name']}. Found {len(assignments)} assignment(s), "
-            f"{len(pending)} pending. Due dates are shown exactly as Moodle displays them."
-        ),
+        "course_resources": resources,
+        "message": message,
     }
 
 
 async def list_assignments(ctx: ToolContext, args: ListAssignmentsArgs) -> dict[str, Any]:
     _require_browser(ctx)
     course_name = args.course_name.strip()
+    course_id = args.course_id.strip()
     current = ctx.current_course()
+    current_id = str((current or {}).get("course_id") or "").strip()
+    same_course = bool(current) and (
+        (bool(course_id) and current_id == course_id)
+        or (
+            not course_id
+            and bool(course_name)
+            and _normalize(current.get("name", "")) == _normalize(course_name)
+        )
+    )
 
-    if course_name and (not current or _normalize(current.get("name", "")) != _normalize(course_name)):
-        course, snapshot, assignments = await _open_course(ctx, course_name)
+    if (course_name or course_id) and not same_course:
+        # Listing assignments does not need the (slow) course-wide download.
+        await _open_course(ctx, course_name, course_id, scan_resources=False)
         current = ctx.current_course()
     else:
         if current is None:
@@ -583,15 +761,65 @@ async def _ensure_assignments(ctx: ToolContext) -> list[dict[str, Any]]:
     return assignments
 
 
+def _assignment_from_db(
+    ctx: ToolContext, query: str, course: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Find a synced assignment when the course page does not list it."""
+
+    course_db_id = (course or {}).get("db_id")
+    try:
+        rows = ctx.db.list_assignments(int(course_db_id)) if course_db_id else ctx.db.list_assignments()
+    except Exception:
+        return None
+    items = [
+        {
+            "name": row.get("name") or "",
+            "url": row.get("url") or "",
+            "due_text": row.get("due_text") or "",
+            "status_text": row.get("status_text") or "",
+            "pending": "not submitted" in (row.get("status_text") or "").lower()
+            or not row.get("status_text"),
+        }
+        for row in rows
+        if row.get("url")
+    ]
+    match, _candidates = _match_item(query, items)
+    return match
+
+
+def _single_pending(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """When a name matches several assignments, one pending one is unambiguous."""
+
+    pending = [item for item in candidates if item.get("pending")]
+    return pending[0] if len(pending) == 1 else None
+
+
 async def open_assignment(ctx: ToolContext, args: OpenAssignmentArgs) -> dict[str, Any]:
     _require_browser(ctx)
-    if args.course_name.strip():
-        current = ctx.current_course()
-        if current is None or _normalize(current.get("name", "")) != _normalize(args.course_name):
-            await _open_course(ctx, args.course_name)
+    course_name = args.course_name.strip()
+    course_id = args.course_id.strip()
+    current = ctx.current_course()
+    current_id = str((current or {}).get("course_id") or "").strip()
+    same_course = bool(current) and (
+        (bool(course_id) and current_id == course_id)
+        or (
+            not course_id
+            and bool(course_name)
+            and _normalize(current.get("name", "")) == _normalize(course_name)
+        )
+        or (not course_name and not course_id)
+    )
+    if (course_name or course_id) and not same_course:
+        # The assignment's own page is what matters here; skip the slow scan and
+        # run it once below, after the workspace exists.
+        await _open_course(ctx, course_name, course_id, scan_resources=False)
 
     assignments = await _ensure_assignments(ctx)
     match, candidates = _match_item(args.assignment_name, assignments)
+    if match is None:
+        match = _single_pending(candidates) or _assignment_from_db(
+            ctx, args.assignment_name, ctx.current_course()
+        )
     if match is None:
         names = [c["name"] for c in candidates]
         raise ToolError(
@@ -661,6 +889,50 @@ async def open_assignment(ctx: ToolContext, args: OpenAssignmentArgs) -> dict[st
         absolute = ctx.jail.resolve("workspace", relative, must_exist=True)
         ctx.db.record_file(relative, absolute.stat().st_size, "workspace", db_id)
 
+    # Course-wide discovery: a lab sheet is often a separate mod/resource in
+    # another section, so look at every downloaded course file and copy the ones
+    # that actually match this assignment.
+    activity_id = str(match.get("activity_id") or _activity_id_from_url(match["url"]))
+    resources = await _ensure_course_resources(
+        ctx, refresh=args.refresh_resources, scan=args.scan_resources
+    )
+
+    manifest: dict[str, Any] = {}
+    course_resources_path = ""
+    try:
+        resource_base, course_resources_path = course_resource_paths(
+            ctx.jail, course_name, known
+        )
+        manifest = load_manifest(resource_base)
+    except Exception:
+        logger.debug("Could not read the course resource manifest", exc_info=True)
+
+    assignment_section = find_assignment_section(
+        manifest, activity_id=activity_id, assignment_url=match["url"]
+    )
+    matches = match_resources(
+        ctx,
+        manifest,
+        assignment_name=assignment_name,
+        instructions=detail.get("instructions", "") or detail.get("full_text", ""),
+        assignment_section=assignment_section,
+        exclude_activity_id=activity_id,
+    )
+    assignment_base = ctx.jail.resolve("workspace", bundle["workspace"], must_exist=True)
+    copied = copy_matches_to_assignment(
+        ctx,
+        assignment_base=assignment_base,
+        assignment_relative=bundle["workspace"],
+        assignment_name=assignment_name,
+        matches=matches,
+    )
+    reference_texts = write_reference_extracts(
+        ctx,
+        assignment_base=assignment_base,
+        assignment_relative=bundle["workspace"],
+        copied=copied,
+    )
+
     ctx.state["current_assignment"] = {
         "name": assignment_name,
         "course_name": course_name,
@@ -671,8 +943,22 @@ async def open_assignment(ctx: ToolContext, args: OpenAssignmentArgs) -> dict[st
         "attachments": detail.get("attachments", []),
         "workspace": bundle["workspace"],
         "db_id": db_id,
+        "course_resources": course_resources_path,
+        "reference_materials": copied,
     }
     ctx.log("reading", f"Opened assignment: {assignment_name}", {"workspace": bundle["workspace"]})
+
+    message = (
+        "Assignment opened and its instructions were saved to the workspace. "
+        "Download attachments explicitly before reading them."
+    )
+    if copied:
+        message += (
+            f" Also copied {len(copied)} matching course resource(s) into "
+            "reference_materials/."
+        )
+    if resources and not resources.get("ok"):
+        message += f" Course resource scan problem: {resources.get('error', '')}"
 
     return {
         "ok": True,
@@ -687,10 +973,11 @@ async def open_assignment(ctx: ToolContext, args: OpenAssignmentArgs) -> dict[st
         "instructions": detail.get("instructions", ""),
         "full_text": (detail.get("full_text") or "")[:8000],
         "workspace": bundle,
-        "message": (
-            "Assignment opened and its instructions were saved to the workspace. "
-            "Download attachments explicitly before reading them."
-        ),
+        "course_resources": resources,
+        "course_resources_path": course_resources_path,
+        "reference_materials": copied,
+        "reference_texts": reference_texts,
+        "message": message,
     }
 
 
@@ -829,8 +1116,10 @@ def register_browser_tools(registry: ToolRegistry) -> None:
         ToolSpec(
             name="open_course",
             description=(
-                "Open a Moodle course by name and return its visible assignments. Use a distinctive "
-                "part of the course name if the exact name is unknown."
+                "Open a Moodle course by name or course_id and return its visible assignments. "
+                "Also scans every course section, downloads teacher files into "
+                "<course>/course_resources/, and records a manifest. Prefer course_id when known. "
+                "Set scan_resources=false to skip the download."
             ),
             args_model=OpenCourseArgs,
             handler=open_course,
@@ -854,7 +1143,9 @@ def register_browser_tools(registry: ToolRegistry) -> None:
             name="open_assignment",
             description=(
                 "Open an assignment, extract its description/deadline/attachments, and create the "
-                "local workspace with the original instructions saved. Read-only on Moodle."
+                "local workspace. Also scans the course's resources and copies matching lab sheets, "
+                "handouts, or slides into <assignment>/reference_materials/. Prefer course_id when "
+                "known. Read-only on Moodle."
             ),
             args_model=OpenAssignmentArgs,
             handler=open_assignment,

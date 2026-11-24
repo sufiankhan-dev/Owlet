@@ -103,14 +103,19 @@ Chrome remembers your login, so next time you usually won't need to log in again
 ## How drafting works
 
 1. Press **Draft** on an assignment, then **Draft with AI**.
-2. Owlet reads the instructions and the teacher's files, then writes the
-   deliverables into that assignment's folder:
+2. Owlet reads the assignment and every teacher file that matches it. A lab
+   sheet is often a separate `mod/resource` in another course section, so opening
+   a course scans all sections and downloads those files first. Matching uses the
+   assignment name, lab/task numbers, section, and the file's actual text; the
+   matches are copied into `reference_materials/`.
+3. It writes the deliverables into that assignment's folder:
    - essays and reports → `documents/` (Word) or `pdfs/`
    - programming work → `code/` (never run)
+   - other hand-in files → `deliverables/`
    - online-text answers → `code/online_text.md`
-3. It also writes `explanations/REVIEW.md`: every requirement and the file that
+4. It also writes `explanations/REVIEW.md`: every requirement and the file that
    covers it, or **MISSING**.
-4. When you've checked the files, press **Mark reviewed**. If anything changes
+5. When you've checked the files, press **Mark reviewed**. If anything changes
    afterwards, Owlet shows **Changed since review**.
 
 The drafts come from a small local model. Treat them as a starting point, expect
@@ -125,12 +130,17 @@ Everything stays on your computer, inside the Owlet folder:
 ```
 workspace/
 └── Database Systems/                 ← one folder per course
+    ├── course_resources/             ← every teacher file, by course section
+    │   ├── manifest.json             what was found, downloaded, or failed
+    │   └── section_1/  section_2/ ...
     └── Normalization Exercise/       ← one folder per assignment
         ├── instructions/assignment.md   the assignment text
-        ├── attachments/                 files from your teacher
+        ├── attachments/                 files linked on the assignment page
+        ├── reference_materials/         course files matched to this assignment
         ├── extracted/                   text pulled from those files
         ├── explanations/REVIEW.md       the draft checklist
         ├── documents/  pdfs/  code/     drafts and generated files
+        ├── deliverables/                other hand-in files
         └── submission/
 ```
 
@@ -166,6 +176,9 @@ loads. With a GPU it's much faster. Asking for one step at a time helps.
 
 - Moodle sites look different. Owlet handles common Moodle 4.x pages and falls
   back to plain page text when a page is unusual.
+- Some courses hide resources or put them behind a separate login. If a download
+  returns HTTP 401/403, log in again in Chrome (or use **Network login**) and
+  retry once; Owlet will not repeat the same failing download.
 - Scanned PDFs (images with no text) can't be read. There's no OCR.
 - Old `.doc` and `.ppt` files aren't read; `.docx` and `.pptx` are.
 - Image questions need a vision-capable model. Owlet reports what the installed
@@ -208,7 +221,7 @@ Everything works without a `.env` file. To change settings, copy
 | `MAX_PAGE_CHARS` | `14000` | Page text sent to the model |
 | `MAX_TOOL_RESULT_CHARS` | `8000` | Tool result cap |
 | `APPROVAL_TIMEOUT_S` | `300` | No answer = denied |
-| `MAX_AGENT_ITERATIONS` | `12` | Tool rounds per chat turn |
+| `MAX_AGENT_ITERATIONS` | `20` | Tool rounds per chat turn |
 | `SYNC_ON_CONNECT` | `true` | Sync automatically once login is detected |
 | `DUE_SOON_HOURS` | `48` | Amber badge threshold |
 | `DUE_URGENT_HOURS` | `24` | Red badge threshold; must not exceed `DUE_SOON_HOURS` |
@@ -288,9 +301,9 @@ None of them can write to Moodle.
 | `get_page_content` | Visible text, headings, links, activities |
 | `navigate_to_url` | Open an allowed read-only Moodle page |
 | `list_courses` | Course overview |
-| `open_course` | Open a course and read its activities |
+| `open_course` | Open a course, scan every section, download its resources |
 | `list_assignments` | Pending assignments with due/status text |
-| `open_assignment` | Read details and save them to the workspace |
+| `open_assignment` | Read details, save the workspace, copy matching resources |
 | `download_attachment` | Save a visible file and extract its text |
 | `read_pdf` | Extract PDF text with page limits |
 | `read_document` | Read DOCX/PPTX/text/code from the workspace |
@@ -336,7 +349,7 @@ Owlet/
 ├── main.py              # entry point → http://127.0.0.1:8765
 ├── app/                 # FastAPI routes, state, sync, drafts, security, ui/
 ├── agent/               # Ollama client, tool-calling loop, prompts
-├── browser/             # visible Chrome session, Moodle parsers
+├── browser/             # visible Chrome session, Moodle parsers, authenticated downloads
 ├── tools/               # the 14 tools and workspace helpers
 ├── database/            # SQLite repository
 ├── tests/               # unit, API, browser, and end-to-end tests
@@ -365,7 +378,7 @@ Draft routes: `GET /api/assignments/{id}/draft`,
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite (no browser, no model): 172 passed, 10 skipped
+# Fast suite (no browser, no model): 188 passed, 10 skipped
 python -m pytest tests -q
 
 # Also run the real-Chrome tests (opens a browser window)

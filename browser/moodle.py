@@ -1094,3 +1094,444 @@ async def fetch_assign_deadlines(
             f"Moodle's deadline list is unavailable ({raw.get('error')})."
         )
     return map_action_events(raw, origin=origin)
+
+
+_COURSE_OUTLINE_JS = r"""
+async ({courseUrl, maxSections, maxActivities}) => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const absolute = (href, base) => {
+    try { return new URL(href || '', base).href; } catch (error) { return ''; }
+  };
+  const origin = (() => {
+    try { return new URL(courseUrl).origin; } catch (error) { return ''; }
+  })();
+  const sameSite = (url) => {
+    try { return new URL(url, courseUrl).origin === origin; } catch (error) { return false; }
+  };
+
+  async function fetchPage(url) {
+    if (!sameSite(url)) return {error: 'blocked'};
+    let response;
+    try {
+      response = await fetch(url, {credentials: 'same-origin', redirect: 'follow'});
+    } catch (error) {
+      return {error: 'request_failed'};
+    }
+    if (response.url && /\/login\//i.test(response.url)) return {login: true};
+    const type = (response.headers.get('content-type') || '').toLowerCase();
+    if (!response.ok) return {error: 'http_' + response.status, status: response.status};
+    if (!type.includes('text/html') && !type.includes('application/xhtml')) {
+      return {
+        directFile: true,
+        finalUrl: response.url || url,
+        contentType: type,
+        disposition: response.headers.get('content-disposition') || ''
+      };
+    }
+    let html;
+    try { html = await response.text(); } catch (error) { return {error: 'body_failed'}; }
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    if ((doc.body.className || '').includes('path-login')) return {login: true};
+    return {doc, finalUrl: response.url || url};
+  }
+
+  function sectionNodes(doc) {
+    const root = doc.querySelector('#region-main, [role="main"], #maincontent, main') || doc.body;
+    let nodes = Array.from(
+      root.querySelectorAll('li.section, div.section, [data-region="course-section"]')
+    );
+    nodes = nodes.filter(
+      (node) => !nodes.some((other) => other !== node && other.contains(node))
+    );
+    return nodes.length ? nodes : [root];
+  }
+
+  function sectionNumber(node, index) {
+    const raw = node.getAttribute('data-number') || node.getAttribute('data-sectionid')
+      || node.getAttribute('data-section') || '';
+    if (/^\d+$/.test(raw)) return Number(raw);
+    const idMatch = (node.id || '').match(/section-(\d+)/i);
+    if (idMatch) return Number(idMatch[1]);
+    const link = node.querySelector('a[href*="section="]');
+    if (link) {
+      const match = (link.href || '').match(/[?&]section=(\d+)/);
+      if (match) return Number(match[1]);
+    }
+    return index;
+  }
+
+  function parseSections(doc, pageUrl) {
+    const nodes = sectionNodes(doc);
+    const out = [];
+    nodes.forEach((node, index) => {
+      const heading = node.querySelector('.sectionname, [data-sectionname], h2, h3, h4');
+      let name = clean(heading ? heading.innerText : '');
+      if (!name) name = clean(node.getAttribute('data-sectionname') || '');
+      const summaryEl = node.querySelector('.summary, .section-summary, .no-overflow');
+      const activities = [];
+      const seen = new Set();
+      node.querySelectorAll('li.activity, .activity-item, [data-region="activity-card"]')
+        .forEach((item) => {
+          const anchor = item.querySelector('.activityname a, a.aalink, a[href*="/mod/"]');
+          const href = absolute(anchor ? anchor.getAttribute('href') : '', pageUrl);
+          if (!/^https?:/i.test(href) || !sameSite(href) || seen.has(href)) return;
+          const nameEl = item.querySelector('.activityname a, .instancename, .activityname');
+          const label = clean(nameEl ? nameEl.innerText : (anchor ? anchor.innerText : ''));
+          if (!label) return;
+          seen.add(href);
+          const classes = Array.from(item.classList).join(' ');
+          const modMatch = classes.match(/modtype_([a-z]+)/);
+          const pathMatch = href.match(/\/mod\/([a-z]+)\//i);
+          const query = href.split('?')[1] || '';
+          const idMatch = query.match(/(?:^|&)id=(\d+)/);
+          activities.push({
+            name: label.slice(0, 250),
+            href,
+            modtype: modMatch ? modMatch[1] : (pathMatch ? pathMatch[1].toLowerCase() : ''),
+            activityId: idMatch ? idMatch[1] : '',
+            files: []
+          });
+        });
+
+      // Labels and section summaries can link straight to a file.
+      const files = [];
+      const seenFiles = new Set();
+      node.querySelectorAll('a[href*="pluginfile.php"]').forEach((a) => {
+        if (a.closest('li.activity, .activity-item, [data-region="activity-card"]')) return;
+        const href = absolute(a.getAttribute('href'), pageUrl);
+        if (!/^https?:/i.test(href) || !sameSite(href) || seenFiles.has(href)) return;
+        seenFiles.add(href);
+        files.push({name: clean(a.innerText).slice(0, 250), href, kind: 'file'});
+      });
+
+      out.push({
+        number: sectionNumber(node, index),
+        name: name.slice(0, 250),
+        summary: clean(summaryEl ? summaryEl.innerText : '').slice(0, 4000),
+        activities,
+        files
+      });
+    });
+    return out;
+  }
+
+  const first = await fetchPage(courseUrl);
+  if (first.login) return {login: true};
+  if (first.error) return {error: first.error, status: first.status || 0};
+  if (first.directFile) return {error: 'not_a_course_page'};
+
+  let sections = parseSections(first.doc, first.finalUrl || courseUrl);
+
+  // "One section per page" course formats expose the rest as ?section=N links.
+  const wanted = new Map();
+  first.doc.querySelectorAll('a[href*="course/view.php"]').forEach((a) => {
+    const href = absolute(a.getAttribute('href'), first.finalUrl || courseUrl);
+    const match = href.match(/[?&]section=(\d+)/);
+    if (match && /\/course\/view\.php/i.test(href)) wanted.set(match[1], href);
+  });
+  const have = new Set(sections.map((section) => String(section.number)));
+  const extra = Array.from(wanted.entries())
+    .filter(([number]) => !have.has(number))
+    .slice(0, maxSections);
+  if (extra.length) {
+    const fetched = await Promise.all(extra.map(async ([, url]) => {
+      const page = await fetchPage(url);
+      if (page.login) return {login: true};
+      if (page.error || page.directFile) return {error: page.error || 'not_html'};
+      return {sections: parseSections(page.doc, page.finalUrl || url)};
+    }));
+    if (fetched.some((item) => item.login)) return {login: true};
+    fetched.forEach((item) => {
+      if (item.sections) sections.push(...item.sections);
+    });
+  }
+
+  const merged = new Map();
+  sections.forEach((section) => {
+    const key = String(section.number) + '|' + section.name.toLowerCase();
+    const existing = merged.get(key);
+    if (!existing) { merged.set(key, section); return; }
+    if (section.activities.length > existing.activities.length) {
+      existing.activities = section.activities;
+    }
+    if (section.files.length) existing.files.push(...section.files);
+    if (!existing.summary && section.summary) existing.summary = section.summary;
+  });
+  sections = Array.from(merged.values()).sort((a, b) => a.number - b.number);
+
+  // Read file-bearing pages so a mod/resource reveals its pluginfile URL.
+  // Assignments are skipped here: their own intro attachments are downloaded by
+  // download_attachment into attachments/, and matching excludes them anyway.
+  const detailTypes = new Set(['resource', 'folder', 'page', 'book']);
+  const jobs = [];
+  sections.forEach((section) => {
+    section.activities.forEach((activity) => {
+      if (detailTypes.has(activity.modtype) && activity.href) jobs.push(activity);
+    });
+  });
+  const limited = jobs.slice(0, maxActivities);
+  const results = await Promise.all(limited.map(async (activity) => {
+    const page = await fetchPage(activity.href);
+    if (page.login) return {login: true};
+    if (page.error) return {error: page.error, status: page.status || 0};
+    if (page.directFile) {
+      return {
+        directFile: true,
+        url: page.finalUrl,
+        contentType: page.contentType,
+        disposition: page.disposition
+      };
+    }
+    const doc = page.doc;
+    doc.querySelectorAll('script, style, noscript').forEach((node) => node.remove());
+    const root = doc.querySelector('#region-main, [role="main"], #maincontent, main') || doc.body;
+    const files = [];
+    const seen = new Set();
+    root.querySelectorAll('a[href*="pluginfile.php"]').forEach((a) => {
+      if (a.closest('.submissionstatustable, .feedback, [data-region="submission-status"]')) return;
+      const href = absolute(a.getAttribute('href'), page.finalUrl || activity.href);
+      if (!/^https?:/i.test(href) || !sameSite(href) || seen.has(href)) return;
+      seen.add(href);
+      files.push({name: clean(a.innerText).slice(0, 250), href, kind: 'file'});
+    });
+    const intro = root.querySelector(
+      '#intro, [data-region="activity-description"], .activity-description'
+    );
+    return {
+      files,
+      text: clean(intro ? intro.innerText : root.innerText).slice(0, 4000)
+    };
+  }));
+  if (results.some((item) => item && item.login)) return {login: true};
+  results.forEach((result, index) => {
+    if (!result || result.login) return;
+    const activity = limited[index];
+    if (result.directFile) {
+      activity.files.push({
+        name: activity.name,
+        href: result.url,
+        kind: 'file',
+        contentType: result.contentType || '',
+        disposition: result.disposition || ''
+      });
+    }
+    if (result.files) activity.files.push(...result.files);
+    if (result.text) activity.text = result.text;
+    if (result.error) activity.error = result.error;
+  });
+
+  return {sections: sections.slice(0, maxSections), fetched: limited.length};
+}
+"""
+
+
+def _url_filename(url: str) -> str:
+    """Filename part of a URL, used as a default label for a loose file link."""
+
+    name = urlparse(url).path.rsplit("/", 1)[-1]
+    return name or "File"
+
+
+def map_course_outline(raw: dict[str, Any], *, course_url: str) -> dict[str, Any]:
+    """Normalise the in-page course scan into sections and resource activities.
+
+    Each section gets a stable 1-based ``index`` (used for
+    ``course_resources/section_N`` folders) and Moodle's own ``number``. File
+    links are made absolute and de-duplicated by URL; nothing is downloaded here.
+    """
+
+    sections: list[dict[str, Any]] = []
+    resources: list[dict[str, Any]] = []
+    seen_activities: set[tuple[str, str]] = set()
+    seen_files: set[str] = set()
+    course_origin = urlparse(course_url)
+
+    def same_site(url: str) -> bool:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.netloc)
+            and parsed.netloc == course_origin.netloc
+        )
+
+    for index, section in enumerate(raw.get("sections", []), start=1):
+        if not isinstance(section, dict):
+            continue
+        name = " ".join(str(section.get("name") or "").split())[:250]
+        number = section.get("number")
+        try:
+            number_value = int(number)
+        except (TypeError, ValueError):
+            number_value = index - 1
+        section_entry = {
+            "index": index,
+            "number": number_value,
+            "name": name or f"Section {index}",
+            "folder": f"section_{index}",
+            "summary": str(section.get("summary") or "")[:4000],
+            "activities": [],
+        }
+
+        def add_resource(
+            *,
+            activity_name: str,
+            href: str,
+            modtype: str,
+            activity_id: str,
+            files: list[dict[str, Any]],
+            text: str = "",
+            error: str = "",
+        ) -> None:
+            absolute = urljoin(course_url, href or "")
+            if not same_site(absolute):
+                return
+            key = (activity_id, absolute)
+            if key in seen_activities:
+                return
+            seen_activities.add(key)
+            clean_files = []
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                file_url = urljoin(course_url, str(item.get("href") or ""))
+                if not same_site(file_url):
+                    continue
+                if file_url in seen_files:
+                    continue
+                seen_files.add(file_url)
+                clean_files.append(
+                    {
+                        "name": str(item.get("name") or "")[:250],
+                        "url": file_url,
+                        "content_type": str(item.get("contentType") or "")[:120],
+                        "disposition": str(item.get("disposition") or "")[:500],
+                    }
+                )
+            entry = {
+                "name": " ".join(activity_name.split())[:250]
+                or f"{modtype.title() or 'Activity'} {activity_id}".strip(),
+                "url": absolute,
+                "activity_id": str(activity_id or "")[:30],
+                "activity_type": (modtype or "link").lower()[:30],
+                "section": index,
+                "section_name": section_entry["name"],
+                "section_folder": section_entry["folder"],
+                "files": clean_files,
+                "text": str(text or "")[:4000],
+                "error": str(error or "")[:300],
+            }
+            resources.append(entry)
+            section_entry["activities"].append(
+                {
+                    "name": entry["name"],
+                    "url": entry["url"],
+                    "activity_id": entry["activity_id"],
+                    "activity_type": entry["activity_type"],
+                    "files": len(clean_files),
+                    "error": entry["error"],
+                }
+            )
+
+        for activity in section.get("activities", []):
+            if not isinstance(activity, dict):
+                continue
+            add_resource(
+                activity_name=str(activity.get("name") or ""),
+                href=str(activity.get("href") or ""),
+                modtype=str(activity.get("modtype") or ""),
+                activity_id=str(activity.get("activityId") or ""),
+                files=list(activity.get("files") or []),
+                text=str(activity.get("text") or ""),
+                error=str(activity.get("error") or ""),
+            )
+
+        # A loose pluginfile link in a label/summary becomes its own resource.
+        for file in section.get("files", []):
+            if not isinstance(file, dict):
+                continue
+            href = str(file.get("href") or "")
+            if not href:
+                continue
+            file_url = urljoin(course_url, href)
+            activity_id = parse_qs(urlparse(file_url).query).get("id", [""])[0]
+            add_resource(
+                activity_name=str(file.get("name") or _url_filename(file_url)),
+                href=file_url,
+                modtype="file",
+                activity_id=activity_id,
+                files=[{"name": str(file.get("name") or ""), "href": file_url}],
+            )
+
+        sections.append(section_entry)
+
+    return {
+        "course_url": course_url,
+        "sections": sections,
+        "resources": resources,
+    }
+
+
+async def fetch_course_outline(
+    page: Page,
+    course_url: str,
+    *,
+    max_sections: int = 40,
+    max_activities: int = 120,
+    timeout_ms: int = 30000,
+) -> dict[str, Any]:
+    """Read every section and resource activity of one course.
+
+    The first attempt runs in the current tab. If the tab is not on the Moodle
+    origin (for example a draft started from a blank page), a short-lived tab is
+    opened on the course URL so Chrome's own session performs the requests.
+    The visible tab is never navigated by the fallback.
+    """
+
+    args = {
+        "courseUrl": course_url,
+        "maxSections": max_sections,
+        "maxActivities": max_activities,
+    }
+
+    async def evaluate(target: Page) -> dict[str, Any]:
+        raw = await target.evaluate(_COURSE_OUTLINE_JS, args)
+        if not isinstance(raw, dict):
+            raise MoodleParseError("Unexpected course scan result.")
+        return raw
+
+    try:
+        raw = await evaluate(page)
+    except PlaywrightTimeoutError as exc:
+        raise MoodleParseError("The course page did not finish loading in time.") from exc
+    except Exception:
+        raw = {"error": "request_failed"}
+
+    if raw.get("error") == "request_failed":
+        tab = None
+        try:
+            tab = await page.context.new_page()
+            await tab.goto(course_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            raw = await evaluate(tab)
+        except Exception as exc:
+            logger.debug("Course scan tab failed: %s", exc)
+            raise MoodleParseError(
+                "Could not read the course page. Open the course in the visible Chrome "
+                "window, finish logging in, then retry."
+            ) from exc
+        finally:
+            if tab is not None:
+                try:
+                    await tab.close()
+                except Exception:
+                    logger.debug("Could not close the course scan tab", exc_info=True)
+
+    if raw.get("login"):
+        raise MoodleLoginLost(
+            "Moodle asked you to log in again. Finish logging in manually in Chrome."
+        )
+    if raw.get("error"):
+        raise MoodleParseError(
+            f"The course could not be scanned ({raw.get('error')}). Open the course page "
+            "in Chrome and try again."
+        )
+    return map_course_outline(raw, course_url=course_url)

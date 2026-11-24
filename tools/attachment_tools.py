@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 from pydantic import Field
 
 from app.security import sanitize_filename, validate_http_url, UrlSecurityError
+from browser.files import MoodleDownloadError, fetch_moodle_file
 from browser.moodle import take_snapshot
 from browser.session import BrowserError
 from tools.base import StrictArgs, ToolContext, ToolError, ToolRegistry, ToolSpec
@@ -65,16 +66,19 @@ def _filename_from_url(url: str) -> str:
     return "attachment"
 
 
-def _is_resource_page(url: str) -> bool:
-    lowered = url.lower()
-    return "/mod/resource/view.php" in lowered or "/mod/folder/view.php" in lowered
-
-
 async def _resolve_attachment_url(
     ctx: ToolContext, url: str
 ) -> tuple[str, str, str | None]:
-    """Return (direct_file_url, suggested_name, return_url_or_none)."""
-    if not _is_resource_page(url):
+    """Return (direct_file_url, suggested_name, return_url_or_none).
+
+    A ``mod/resource/view.php`` link is left alone: Moodle redirects it straight
+    to the protected ``pluginfile.php`` URL, and the download helper follows that
+    redirect with the authenticated session. Only a folder page needs parsing,
+    because it lists several files.
+    """
+
+    lowered = url.lower()
+    if "/mod/folder/view.php" not in lowered:
         return url, "", None
 
     try:
@@ -96,7 +100,7 @@ async def _resolve_attachment_url(
         return link["href"], link.get("text", ""), None
     if len(candidates) > 1:
         raise ToolError(
-            "That resource page contains several files. Choose one and call download_attachment "
+            "That folder contains several files. Choose one and call download_attachment "
             "for each file.",
             data={
                 "candidates": [
@@ -106,8 +110,8 @@ async def _resolve_attachment_url(
             },
         )
     raise ToolError(
-        "No downloadable file was found on that resource page. It may be a label, page, or "
-        "external link rather than a file."
+        "No downloadable file was found on that folder page. It may be empty or use an "
+        "external link."
     )
 
 
@@ -133,48 +137,61 @@ async def download_attachment(ctx: ToolContext, args: DownloadArgs) -> dict[str,
             "is saved in the right workspace."
         )
 
+    # A failed authentication or a removed file is not retried in a loop. The
+    # model gets the reason and the next step instead of hammering Moodle.
+    attempts: dict[str, dict[str, Any]] = ctx.state.setdefault("download_attempts", {})
+    previous = attempts.get(url) or {}
+    if previous.get("kind") in {"auth", "not_found"} or int(previous.get("count") or 0) >= 2:
+        raise ToolError(
+            f"{previous.get('error') or 'This download already failed.'} "
+            "I will not retry the same URL again in this run. Continue with the other "
+            "materials, or ask the user to fix the login/remove the dead link.",
+            data={"already_attempted": True, "url": url, "kind": previous.get("kind", "")},
+        )
+
     ctx.check_cancel()
     ctx.log("download", f"Fetching attachment: {urlparse(url).path.rsplit('/', 1)[-1]}")
     direct_url, link_text, _return_url = await _resolve_attachment_url(ctx, url)
 
     try:
-        response = await ctx.browser.page.request.get(
-            direct_url, timeout=ctx.settings.browser_timeout_ms
+        downloaded = await fetch_moodle_file(
+            ctx.browser,
+            direct_url,
+            max_bytes=ctx.settings.max_download_bytes,
+            timeout_ms=ctx.settings.browser_timeout_ms,
+            referer=assignment.get("url") or course.get("url") or ctx.browser.page.url,
         )
-    except Exception as exc:
-        raise ToolError(f"Download failed: {exc}") from exc
-
-    if response.status >= 400:
+    except MoodleDownloadError as exc:
+        attempts[url] = {
+            "kind": exc.kind,
+            "error": exc.message,
+            "count": int(previous.get("count") or 0) + 1,
+        }
         raise ToolError(
-            f"Moodle returned HTTP {response.status} for that file. It may require a different "
-            "login, or the link may have expired."
-        )
+            exc.message,
+            data={
+                "kind": exc.kind,
+                "status": exc.status or 0,
+                "already_attempted": exc.kind in {"auth", "not_found"},
+                "next_step": (
+                    "Ask the user to log in again in Chrome, then start a new request."
+                    if exc.kind == "auth"
+                    else "Continue with the other course resources and report this file."
+                ),
+            },
+        ) from exc
 
-    headers = response.headers
-    content_type = headers.get("content-type", "").split(";")[0].strip().lower()
-    if content_type in {"text/html", "application/xhtml+xml"}:
-        raise ToolError(
-            "Moodle returned an HTML page instead of a file. The link may point to a view page "
-            "or your session may have expired."
-        )
-
-    length_header = headers.get("content-length")
-    if length_header and length_header.isdigit():
-        if int(length_header) > ctx.settings.max_download_bytes:
-            raise ToolError(
-                f"That file is larger than the {ctx.settings.max_download_mb} MB download limit."
-            )
-
-    body = await response.body()
-    if len(body) > ctx.settings.max_download_bytes:
-        raise ToolError(
-            f"That file is larger than the {ctx.settings.max_download_mb} MB download limit."
-        )
+    headers = {
+        "content-type": downloaded.content_type,
+        "content-disposition": downloaded.content_disposition,
+    }
+    content_type = downloaded.content_type
+    body = downloaded.body
 
     suggested = (
         args.filename.strip()
         or filename_from_disposition(headers.get("content-disposition"))
-        or (_filename_from_url(direct_url) if direct_url != url else "")
+        or _filename_from_url(downloaded.final_url)
         or link_text
         or "attachment"
     )

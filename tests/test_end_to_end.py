@@ -16,6 +16,7 @@ import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import fitz
 import pytest
@@ -50,8 +51,13 @@ COURSE = """<!doctype html><html><head><title>Database Systems</title></head>
   <div data-region="activity-dates">Due: 12 November 2026, 11:59 PM</div>
   <div class="submissionstatus">Not submitted</div>
 </li>
+<li class="activity modtype_assign">
+  <div class="activityname"><a href="/mod/assign/view.php?id=20">LAB TASK 1</a></div>
+  <div data-region="activity-dates">Due: 19 November 2026, 11:59 PM</div>
+  <div class="submissionstatus">Not submitted</div>
+</li>
 <li class="activity modtype_resource">
-  <div class="activityname"><a href="/mod/resource/view.php?id=11">Week 4 Slides</a></div>
+  <div class="activityname"><a href="/mod/resource/view.php?id=11">LAB 1</a></div>
 </li>
 </ul><a href="/login/logout.php">Log out</a>
 </div></body></html>"""
@@ -69,43 +75,72 @@ course_name, instructor) to 3NF. Explain each normal form and submit a PDF.</p><
 <a href="/login/logout.php">Log out</a>
 </div></body></html>"""
 
+LAB_ASSIGNMENT = """<!doctype html><html><head><title>LAB TASK 1</title></head>
+<body class="path-mod-assign"><div id="region-main">
+<nav aria-label="Breadcrumb"><a href="/my/">Dashboard</a>
+<a href="/course/view.php?id=2">Database Systems</a></nav>
+<h1>LAB TASK 1</h1>
+<div id="intro"><p>Complete LAB 1 using the lab sheet. Normalize the relation and
+submit a short report.</p></div>
+<div data-region="activity-dates">Due: 19 November 2026, 11:59 PM</div>
+<div class="submissionstatustable">Submission status: No attempt</div>
+<a href="/login/logout.php">Log out</a>
+</div></body></html>"""
 
-def _make_pdf() -> bytes:
+RESOURCE_LAB1 = """<!doctype html><html><head><title>LAB 1</title></head>
+<body class="path-mod-resource"><div id="region-main">
+<h1>LAB 1</h1>
+<div id="intro"><p>LAB 1 tasks: normalize the StudentCourse relation to 3NF.</p></div>
+<a href="/pluginfile.php/11/mod_resource/content/0/lab1.pdf">lab1.pdf</a>
+<a href="/login/logout.php">Log out</a>
+</div></body></html>"""
+
+
+def _make_pdf(text: str) -> bytes:
     document = fitz.open()
     page = document.new_page()
-    page.insert_text(
-        (60, 80),
-        "Normalization Exercise\n\nRelation: StudentCourse(student_id, course_id,\n"
-        "student_name, course_name, instructor)\n\nTask: normalize to 3NF.",
-        fontsize=11,
-    )
+    page.insert_text((60, 80), text, fontsize=11)
     data = document.tobytes()
     document.close()
     return data
 
 
-PDF_BYTES = _make_pdf()
+PDF_BYTES = _make_pdf(
+    "Normalization Exercise\n\nRelation: StudentCourse(student_id, course_id,\n"
+    "student_name, course_name, instructor)\n\nTask: normalize to 3NF."
+)
+LAB_PDF_BYTES = _make_pdf(
+    "LAB 1\n\nTask: normalize the StudentCourse relation to 3NF.\n"
+    "Explain each normal form."
+)
 
 
 class _Handler(BaseHTTPRequestHandler):
+    def _send_pdf(self, body: bytes, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?")[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/pluginfile.php/99/mod_assign/intro/instructions.pdf":
-            body = PDF_BYTES
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pdf")
-            self.send_header(
-                "Content-Disposition", 'attachment; filename="instructions.pdf"'
-            )
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_pdf(PDF_BYTES, "instructions.pdf")
+            return
+        if path == "/pluginfile.php/11/mod_resource/content/0/lab1.pdf":
+            self._send_pdf(LAB_PDF_BYTES, "lab1.pdf")
             return
 
         if path == "/course/view.php":
             body = COURSE
         elif path == "/mod/assign/view.php":
-            body = ASSIGNMENT
+            body = LAB_ASSIGNMENT if query.get("id", [""])[0] == "20" else ASSIGNMENT
+        elif path == "/mod/resource/view.php":
+            body = RESOURCE_LAB1
         else:
             body = COURSES
         encoded = body.encode("utf-8")
@@ -183,8 +218,13 @@ def test_full_assignment_workflow(tmp_path: Path, mock_moodle: str) -> None:
             }
 
             opened = await call("open_course", course_name="Database Systems")
-            assert opened["pending_count"] == 1
-            assert opened["assignments"][0]["name"] == "Normalization Exercise"
+            assert opened["pending_count"] == 2
+            names = [item["name"] for item in opened["assignments"]]
+            assert set(names) == {"Normalization Exercise", "LAB TASK 1"}
+            # The course-wide scan downloaded the separate LAB 1 resource.
+            resources = settings.workspace_dir / "Database Systems" / "course_resources"
+            assert (resources / "manifest.json").is_file()
+            assert (resources / "section_1" / "lab1.pdf").read_bytes().startswith(b"%PDF")
 
             assignment = await call(
                 "open_assignment", assignment_name="Normalization Exercise"
@@ -278,6 +318,21 @@ def test_full_assignment_workflow(tmp_path: Path, mock_moodle: str) -> None:
             assert db.list_assignments()[0]["name"] == "Normalization Exercise"
             assert any(kind == "file" for kind, _message in events)
             assert any(kind == "download" for kind, _message in events)
+
+            # A separate LAB 1 resource in the same course is matched to LAB TASK 1
+            # and copied with its original filename.
+            lab = await call(
+                "open_assignment",
+                assignment_name="LAB TASK 1",
+                course_name="Database Systems",
+            )
+            assert lab["assignment"]["name"] == "LAB TASK 1"
+            assert "lab1.pdf" in {item["filename"] for item in lab["reference_materials"]}
+            lab_base = settings.workspace_dir / "Database Systems" / "LAB TASK 1"
+            assert (lab_base / "reference_materials" / "lab1.pdf").read_bytes().startswith(
+                b"%PDF"
+            )
+            assert (lab_base / "extracted" / "references" / "lab1.txt").is_file()
         finally:
             await session.close()
             db.close()

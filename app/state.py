@@ -375,12 +375,24 @@ class AppState:
                 "submission_status_text": row.get("status_text") or "",
                 "workspace": relative,
                 "db_id": assignment_id,
+                "course_resources": f"{relative.rsplit('/', 1)[0]}/course_resources",
+                "reference_materials": [],
             }
         }
-        if row.get("course_url"):
+        course_row = None
+        if row.get("course_id"):
+            try:
+                course_row = self.db.get_course(int(row["course_id"]))
+            except Exception:
+                course_row = None
+        course_url = row.get("course_url") or (course_row or {}).get("url")
+        if course_url:
             seed["current_course"] = {
                 "name": course_name,
-                "url": row["course_url"],
+                "url": course_url,
+                "course_id": row.get("course_moodle_id")
+                or (course_row or {}).get("moodle_id")
+                or "",
                 "db_id": row.get("course_id"),
             }
         run = AgentRun(

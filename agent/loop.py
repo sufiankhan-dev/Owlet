@@ -157,6 +157,8 @@ class MoodleAgent:
         outcome = AgentOutcome(model=self.settings.ollama_model)
         files_created = 0
         nudges = 0
+        consecutive_failures = 0
+        blocked_repeats = 0
 
         for step in range(1, self.settings.max_agent_iterations + 1):
             if run.stop_requested:
@@ -261,8 +263,10 @@ class MoodleAgent:
                     outcome.cancelled = True
                     return await self._finish(run, outcome, emit, "Stopped by user")
                 outcome.tool_calls += 1
-                tool_payload = await self._execute_tool(ctx, call, emit, run)
-                if call.name in _FILE_TOOLS and '"ok": true' in tool_payload:
+                tool_payload, tool_ok, blocked = await self._execute_tool(
+                    ctx, call, emit, run
+                )
+                if call.name in _FILE_TOOLS and tool_ok:
                     files_created += 1
                 messages.append(
                     {
@@ -271,6 +275,20 @@ class MoodleAgent:
                         "content": tool_payload,
                     }
                 )
+                consecutive_failures = 0 if tool_ok else consecutive_failures + 1
+                blocked_repeats = blocked_repeats + 1 if blocked else 0
+                if blocked_repeats >= 2:
+                    outcome.error = (
+                        "Stopped because the model kept repeating a tool call that had "
+                        "already failed twice. The real error is in the earlier tool result."
+                    )
+                    return await self._finish(run, outcome, emit, outcome.content)
+                if consecutive_failures >= 8:
+                    outcome.error = (
+                        "Stopped after 8 consecutive tool failures to avoid a loop. "
+                        "Check the browser login and the Moodle URLs, then try a smaller step."
+                    )
+                    return await self._finish(run, outcome, emit, outcome.content)
 
         outcome.error = (
             f"Stopped after {self.settings.max_agent_iterations} tool rounds to avoid a loop. "
@@ -294,15 +312,53 @@ class MoodleAgent:
         call: ToolCallRequest,
         emit: EmitFn,
         run: AgentRun,
-    ) -> str:
+    ) -> tuple[str, bool, bool]:
+        """Run one tool call.
+
+        Returns ``(serialized_payload, ok, repeat_blocked)``. A call that has
+        already failed twice with the exact same arguments is not run again: the
+        model gets a clear "change approach" message instead of burning every
+        remaining round on the same broken request.
+        """
+
+        try:
+            signature = call.name + "|" + json.dumps(
+                call.arguments, sort_keys=True, default=str
+            )
+        except Exception:
+            signature = call.name
+        failures: dict[str, int] = ctx.state.setdefault("tool_failure_signatures", {})
+        if failures.get(signature, 0) >= 2:
+            payload = {
+                "ok": False,
+                "error": (
+                    "This exact tool call already failed twice in this run. Do not call it "
+                    "again. Read the earlier error, change the arguments or the approach, "
+                    "and if it still cannot work, tell the user what is blocking it."
+                ),
+                "repeat_blocked": True,
+            }
+            emit("tool_result", payload["error"], payload)
+            ctx.log("tool", payload["error"], {"tool": call.name, "ok": False})
+            return self._serialize(payload), False, True
+
+        def finish(payload: dict[str, Any], message: str) -> tuple[str, bool, bool]:
+            ok = bool(payload.get("ok"))
+            if ok:
+                failures.pop(signature, None)
+            else:
+                failures[signature] = failures.get(signature, 0) + 1
+            emit("tool_result", message, payload)
+            ctx.log("tool", message, {"tool": call.name, "ok": ok})
+            return self._serialize(payload), ok, False
+
         spec = self.registry.get(call.name)
         if spec is None:
             payload = {
                 "ok": False,
                 "error": f"Unknown tool {call.name!r}. Available tools: {self.registry.names()}",
             }
-            emit("tool_result", f"Unknown tool: {call.name}", payload)
-            return self._serialize(payload)
+            return finish(payload, f"Unknown tool: {call.name}")
 
         emit(
             "tool_start",
@@ -319,8 +375,7 @@ class MoodleAgent:
                 "error": "Invalid arguments for this tool.",
                 "details": exc.errors(include_url=False),
             }
-            emit("tool_result", f"Invalid arguments for {call.name}", payload)
-            return self._serialize(payload)
+            return finish(payload, f"Invalid arguments for {call.name}")
 
         try:
             ctx.check_cancel()
@@ -346,9 +401,7 @@ class MoodleAgent:
             }
             message = payload["error"]
 
-        emit("tool_result", message, payload)
-        ctx.log("tool", message, {"tool": call.name, "ok": payload.get("ok")})
-        return self._serialize(payload)
+        return finish(payload, message)
 
     def _serialize(self, payload: dict[str, Any]) -> str:
         text = json.dumps(payload, ensure_ascii=False, default=str)
