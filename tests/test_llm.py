@@ -110,6 +110,116 @@ def test_health_is_offline_when_the_daemon_cannot_be_reached(tmp_path) -> None:
     assert health["error"] == "Cannot reach Ollama."
 
 
+class _Stream:
+    """Async iterator over pre-built Ollama stream parts."""
+
+    def __init__(self, parts) -> None:
+        self._parts = iter(parts)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._parts)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+class _ChatClient:
+    """Serves one canned stream per ``chat()`` call, recording the kwargs."""
+
+    def __init__(self, attempts) -> None:
+        self._attempts = list(attempts)
+        self.calls: list[dict] = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return _Stream(self._attempts.pop(0))
+
+
+def _part(content: str = "", *, thinking: str = "", tool_calls=None, done: bool = True):
+    return SimpleNamespace(
+        message=SimpleNamespace(
+            content=content, thinking=thinking, tool_calls=tool_calls
+        ),
+        done=done,
+        done_reason="stop",
+        total_duration=1_000_000_000,
+        prompt_eval_count=10,
+        eval_count=5,
+    )
+
+
+def _thinking_service(tmp_path, attempts) -> tuple[OllamaService, _ChatClient]:
+    service = _service(tmp_path, "qwen3.5:9b")
+    service.settings = replace(service.settings, ollama_think=True)
+    client = _ChatClient(attempts)
+    service._client = client
+    return service, client
+
+
+def test_thinking_only_reply_is_retried_with_thinking_disabled(tmp_path) -> None:
+    service, client = _thinking_service(
+        tmp_path,
+        [
+            [_part("", thinking="The user wants an explanation, so I should...")],
+            [_part("Here is the step-by-step explanation.")],
+        ],
+    )
+
+    result = asyncio.run(service.stream_chat([{"role": "user", "content": "Explain."}]))
+
+    assert result.content == "Here is the step-by-step explanation."
+    assert len(client.calls) == 2, "a thinking-only round must be retried once"
+    assert client.calls[0]["think"] is True
+    assert client.calls[1]["think"] is False
+
+
+def test_tool_call_without_text_is_not_retried(tmp_path) -> None:
+    call = SimpleNamespace(
+        function=SimpleNamespace(name="read_pdf", arguments={"path": "a.pdf"})
+    )
+    service, client = _thinking_service(
+        tmp_path, [[_part("", thinking="I need the file.", tool_calls=[call])]]
+    )
+
+    result = asyncio.run(
+        service.stream_chat(
+            [{"role": "user", "content": "Read it."}],
+            tools=[{"type": "function", "function": {"name": "read_pdf"}}],
+        )
+    )
+
+    assert [c.name for c in result.tool_calls] == ["read_pdf"]
+    assert len(client.calls) == 1, "a tool round is progress; do not retry it"
+
+
+def test_silent_round_with_nothing_streamed_is_retried_once(tmp_path) -> None:
+    service, client = _thinking_service(
+        tmp_path, [[_part("")], [_part("Recovered answer.")]]
+    )
+
+    result = asyncio.run(service.stream_chat([{"role": "user", "content": "Explain."}]))
+
+    assert result.content == "Recovered answer."
+    assert len(client.calls) == 2
+    assert client.calls[1]["think"] is False
+
+
+def test_retry_result_is_used_when_it_also_comes_back_empty(tmp_path) -> None:
+    service, client = _thinking_service(
+        tmp_path,
+        [[_part("", thinking="first attempt")], [_part("", thinking="second attempt")]],
+    )
+
+    result = asyncio.run(service.stream_chat([{"role": "user", "content": "Explain."}]))
+
+    assert result.content == ""
+    assert result.thinking, "the reasoning is kept for diagnostics"
+    assert len(client.calls) == 2
+
+
 def test_health_says_whether_the_model_runs_here_or_on_a_peer(tmp_path) -> None:
     local = _service(tmp_path, "qwen3.5:9b")
     local._client = _StubClient([{"name": "qwen3.5:9b"}])

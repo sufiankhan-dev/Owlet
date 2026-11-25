@@ -238,8 +238,9 @@ class MoodleAgent:
                 if not outcome.content:
                     # Reported once, by _finish.
                     outcome.error = (
-                        "The model returned an empty response. Try rephrasing, or check that "
-                        f"{self.settings.ollama_model} is installed and running."
+                        "The model returned no visible answer. Thinking mode may have used "
+                        "the whole reply for reasoning; try again, or set OLLAMA_THINK=false. "
+                        f"Also check that {self.settings.ollama_model} is installed and running."
                     )
                 return await self._finish(run, outcome, emit, outcome.content)
 

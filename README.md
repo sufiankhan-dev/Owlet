@@ -210,7 +210,7 @@ Everything works without a `.env` file. To change settings, copy
 | `OLLAMA_NUM_CTX` | `16384` | Context window |
 | `OLLAMA_TEMPERATURE` | `0.2` | Lower is more predictable |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the model loaded between turns |
-| `OLLAMA_THINK` | `false` | Thinking mode roughly doubles CPU latency |
+| `OLLAMA_THINK` | `false` | Thinking mode roughly doubles CPU latency; a round that returns no visible text is retried once without thinking |
 | `MAX_IMAGE_MB` | `8` | Per-image cap after the browser downscales it |
 | `MAX_IMAGES_PER_MESSAGE` | `4` | Attachments allowed on one message |
 | `BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` |
