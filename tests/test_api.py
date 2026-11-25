@@ -121,6 +121,20 @@ def test_ui_assets_are_served_with_security_headers(api) -> None:
     assert client.get("/favicon.ico").status_code == 204
 
 
+def test_dashboard_function_names_are_unique(api) -> None:
+    """A duplicate declaration hoists and silently replaces the earlier one.
+
+    Both ``hasFiles`` helpers once shared this name, so the tree helper was
+    overwritten by the drag-and-drop one and the Files card showed every course
+    as empty.
+    """
+    client, _state, _settings = api
+    script = client.get("/app.js").text
+    names = re.findall(r"^  function (\w+)\(", script, re.MULTILINE)
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    assert duplicates == []
+
+
 def test_network_credentials_are_transient_only(api) -> None:
     client, _state, _settings = api
 
