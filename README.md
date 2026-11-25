@@ -13,7 +13,10 @@ assignment, plan your work, or draft a first version of the deliverables.
 - **Transparent.** Chrome stays visible, so you see every page Owlet opens.
 - **Read-only.** Owlet never submits, uploads, deletes, or changes anything on
   Moodle. You stay in control.
-- **Never sees your password.** You log in to Moodle yourself, in Chrome.
+- **Your password stays yours.** By default you log in to Moodle yourself in
+  Chrome. If you opt in with `LMS_AUTO_LOGIN=true`, Owlet types the credentials
+  from `.env` into the plain Moodle form when the session expires — never an SSO
+  or MFA page, never logged, one attempt per connection.
 
 > **Use it responsibly.** Owlet is a reading and drafting aid. Follow your
 > institution's academic-integrity rules and check whether AI help is allowed in
@@ -92,6 +95,13 @@ Then open **http://127.0.0.1:8765** in your browser.
    to attach a screenshot or photo, or paste/drop images straight into the chat.
 
 Chrome remembers your login, so next time you usually won't need to log in again.
+
+> **Want Owlet to log in for you when the session expires?** Put
+> `LMS_AUTO_LOGIN=true`, `LMS_USERNAME`, and `LMS_PASSWORD` in `.env`. It then
+> fills the plain Moodle login form once per connection, in the same visible
+> Chrome window. SSO/MFA/CAPTCHA pages are never filled, the password is never
+> logged or stored in the database, and a wrong password is not retried, so the
+> account cannot be locked in a loop.
 
 > **Does your campus show a username/password popup *before* the Moodle page
 > even loads?** That's network login (HTTP Basic auth), not Moodle. Open
@@ -217,6 +227,9 @@ Everything works without a `.env` file. To change settings, copy
 | `BROWSER_HEADLESS` | `false` | Must stay `false` for manual login and oversight |
 | `BROWSER_TIMEOUT_MS` | `30000` | Page navigation timeout |
 | `MOODLE_URL` | *(empty)* | Your Moodle site; or set it in the dashboard |
+| `LMS_AUTO_LOGIN` | `false` | Opt in to automatic Moodle account login; needs the two below |
+| `LMS_USERNAME` | *(empty)* | Moodle username used only when `LMS_AUTO_LOGIN=true` |
+| `LMS_PASSWORD` | *(empty)* | Moodle password used only when `LMS_AUTO_LOGIN=true`; never logged or stored |
 | `MAX_DOWNLOAD_MB` | `50` | Attachment size cap |
 | `MAX_PAGE_CHARS` | `14000` | Page text sent to the model |
 | `MAX_TOOL_RESULT_CHARS` | `8000` | Tool result cap |
@@ -260,7 +273,7 @@ peer while this is on, and the dashboard labels the model as `remote` instead of
 ```
 Visible Chrome  <--Playwright-->  BrowserSession  -->  Moodle parsers
       |                                                    |
-      | manual login                                       v
+      | manual login (or opt-in auto-login)                v
       +--------------------> AppState sync  --------->  Tool registry
                                    |                       |
    FastAPI + SSE  <---- events/approvals ----  Agent loop (validated tool calls)
@@ -323,7 +336,10 @@ grading, profile editing, and submission paths.
 - **Loopback only.** `APP_HOST` is validated at startup; Host and Origin headers
   are checked on every request.
 - **CSRF guard.** Every POST/PUT/PATCH/DELETE needs the header `X-Owlet: 1`.
-- **No Moodle password handling.** Login happens in Chrome; the app never sees it.
+- **No Moodle password handling by default.** Login happens in Chrome. If you
+  opt in with `LMS_AUTO_LOGIN=true`, the pair from `.env` is kept in memory,
+  excluded from `repr`, typed only into the plain Moodle form (never SSO/MFA),
+  tried once per connection, and never logged or stored in the database.
 - **Network login is transient.** The optional HTTP Basic auth pair goes straight
   to Playwright, lives in memory, is cleared on disconnect, and is never logged
   or stored.
@@ -378,7 +394,7 @@ Draft routes: `GET /api/assignments/{id}/draft`,
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Fast suite (no browser, no model): 188 passed, 10 skipped
+# Fast suite (no browser, no model): 196 passed, 15 skipped
 python -m pytest tests -q
 
 # Also run the real-Chrome tests (opens a browser window)
@@ -403,8 +419,8 @@ into, read-only Moodle, and so on).
 
 Issues and pull requests are welcome. Before you start, read
 [AGENTS.md](AGENTS.md), run `python -m pytest tests -q`, and keep the safety
-rules intact: **no cloud AI, read-only Moodle, no passwords, nothing runs
-automatically.**
+rules intact: **no cloud AI, read-only Moodle, no passwords by default, nothing
+runs automatically.**
 
 ## Disclaimer
 

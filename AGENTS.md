@@ -20,7 +20,7 @@ from the owner — and even then, stop and confirm.
 | --- | --- | --- |
 | **Loopback only** | `app/config.py` (`load_settings`), `app/api.py` (`local_only`) | `APP_HOST` stays `127.0.0.1`/`localhost`/`::1`. Host and `Origin` headers are checked on every request. |
 | **Local model by default** | `app/config.py` (`load_settings`) | `OLLAMA_HOST` must resolve to loopback unless `OLLAMA_ALLOW_REMOTE=true`, which admits only Tailscale peers (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`). Public, cloud, and LAN endpoints stay refused. |
-| **No password handling** | `browser/session.py`, `app/ui/` | Moodle *account* login is manual in visible Chrome; the app never asks for, reads, types, logs, or stores it. The single exception is the optional **network** (HTTP Basic auth) pair in the collapsed "Network login" panel: it goes straight to Playwright's context at launch, lives in memory only, is cleared on disconnect, and is never logged, stored, or put in the database. |
+| **No password handling by default** | `browser/session.py`, `app/config.py`, `app/ui/` | Moodle *account* login is manual in visible Chrome unless the owner explicitly opts in with `LMS_AUTO_LOGIN=true`. Even then the password comes only from `.env`, stays in memory, is excluded from `repr`, is typed only into the plain Moodle form (never an SSO/MFA/CAPTCHA page), and gets **one attempt per connection** so a wrong password cannot lock the account. It is never logged, stored in the database, or sent to the model. The other exception is the optional **network** (HTTP Basic auth) pair in the collapsed "Network login" panel: it goes straight to Playwright's context at launch, lives in memory only, is cleared on disconnect, and is never logged, stored, or put in the database. |
 | **Read-only Moodle** | `app/security.py`, `browser/moodle.py`, `tools/` | No submit, upload, delete, grade, profile, or enrolment actions. Dangerous paths stay blocked even if the model asks. |
 | **Path jail** | `app/security.py` (`PathJail`), `tools/` | All writes resolve under `workspace/` or `generated/`. Reject traversal, absolute paths, symlinks. |
 | **Approval gate** | `app/state.py`, `tools/base.py` (`ToolContext.require_approval`) | Overwrites and refreshes pause for a click. Timeout = deny. Stop = deny pending. |
@@ -50,7 +50,8 @@ agent/
   loop.py               # MoodleAgent: bounded tool-calling loop, Stop handling
   prompts.py            # system prompt, untrusted-content rules
 browser/
-  session.py            # visible persistent Chrome via Playwright, login detection
+  session.py            # visible persistent Chrome via Playwright, login detection,
+                        # optional opt-in auto-login (LMS_AUTO_LOGIN)
   moodle.py             # DOM snapshot + Moodle parsers (courses, assignments)
 tools/
   base.py               # ToolSpec / ToolRegistry / ToolContext / ToolError / StrictArgs
@@ -199,7 +200,8 @@ lowercase, imperative, no trailing period — see `git log`.
 - Model output is untrusted: Markdown is escaped before the allow-listed formatter
   runs, and links are limited to `http(s)`.
 - The dashboard asks for **no credentials** — no password field anywhere. Login
-  happens in visible Chrome (§1).
+  happens in visible Chrome (§1); the optional auto-login pair lives only in
+  `.env` and is never sent to the client.
 - `app/ui/` is copied into `tmp_path` by `tests/test_api.py`, which asserts the
   three assets, their security headers, and the absence of credential inputs.
 

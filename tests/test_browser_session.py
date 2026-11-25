@@ -70,6 +70,9 @@ def test_visible_browser_login_detection(tmp_path: Path, mock_moodle: str) -> No
         load_settings(),
         browser_profile_dir=tmp_path / "profile",
         moodle_url=None,
+        lms_auto_login=False,
+        lms_username="",
+        lms_password="",
     )
 
     async def scenario() -> None:

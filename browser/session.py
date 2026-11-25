@@ -2,7 +2,10 @@
 
 Design rules enforced here:
 * The browser is never headless: the user must see what the agent is doing.
-* No password is read, typed, stored, or logged. Login is manual.
+* Login is manual by default. It becomes automatic only when the owner sets
+  ``LMS_AUTO_LOGIN=true``; even then the password is typed only into the plain
+  Moodle login form, never an SSO/MFA page, never logged, and one attempt per
+  connection is made so a wrong password cannot lock the account in a loop.
 * All navigation is http(s) and, for model-requested navigation, restricted to
   the configured Moodle host (and its subdomains).
 * The persistent profile lives under ``browser/profile`` and is gitignored.
@@ -16,6 +19,7 @@ import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -55,6 +59,7 @@ class BrowserStatus:
     logged_in: bool | None = None
     profile_dir: str = ""
     channel: str = "chrome"
+    auto_login: bool = False
     error: str | None = None
     opened_at: str | None = None
 
@@ -81,11 +86,17 @@ class BrowserSession:
         self._status = BrowserStatus(
             profile_dir=str(settings.browser_profile_dir),
             channel=settings.browser_channel,
+            auto_login=settings.lms_credentials is not None,
         )
         self._launch_lock = asyncio.Lock()
         self._closed_by_user = False
         self._native_auth_prompt = False
         self._http_credentials: dict[str, str] | None = None
+        # One automatic login attempt per browser launch. A wrong password must
+        # never turn a status poll into a retry loop that locks the account.
+        self._auto_login_attempted = False
+        self._auto_login_lock = asyncio.Lock()
+        self._auto_login_skipped_url = ""
 
     # ---------- public state ----------
 
@@ -106,6 +117,12 @@ class BrowserSession:
         """In-memory network credentials, if Chrome was launched with them."""
 
         return self._http_credentials
+
+    @property
+    def auto_login_enabled(self) -> bool:
+        """True only when the owner opted in and both credentials are present."""
+
+        return self.settings.lms_credentials is not None
 
     @property
     def page(self) -> Page:
@@ -172,6 +189,8 @@ class BrowserSession:
                     return self._status
 
             self._closed_by_user = False
+            self._auto_login_attempted = False
+            self._auto_login_skipped_url = ""
             self._http_credentials = dict(http_credentials) if http_credentials else None
             self._set_state(BrowserState.STARTING)
             self._emit("browser", "Launching visible Chrome with the persistent profile")
@@ -336,14 +355,14 @@ class BrowserSession:
             return self._status
 
         page = self._require_page()
-        try:
-            self._status.url = redact_url(page.url)
-            self._status.title = (await page.title())[:200]
-        except PlaywrightError:
+        if not await self._read_page(page):
             return self._status
 
-        logged_in = await self._detect_login(page)
-        self._status.logged_in = logged_in
+        if self._status.logged_in is False and self.auto_login_enabled:
+            if await self._try_auto_login():
+                await self._read_page(page)
+
+        logged_in = self._status.logged_in
         if logged_in is True:
             if self._status.state != BrowserState.READY:
                 self._emit("browser", "Moodle session detected: logged in")
@@ -359,6 +378,136 @@ class BrowserSession:
             if self._status.state not in {BrowserState.ERROR, BrowserState.STARTING}:
                 self._set_state(BrowserState.UNKNOWN, error=self._status.error)
         return self._status
+
+    async def _read_page(self, page: Page) -> bool:
+        """Refresh url, title, and login markers. False when unreadable."""
+
+        try:
+            self._status.url = redact_url(page.url)
+            self._status.title = (await page.title())[:200]
+        except PlaywrightError:
+            return False
+        self._status.logged_in = await self._detect_login(page)
+        return True
+
+    async def _try_auto_login(self) -> bool:
+        """Type the opt-in credentials into the plain Moodle form, once.
+
+        Returns True only when the page afterwards looks logged in. SSO/MFA,
+        CAPTCHA, and unknown sign-in pages are never filled: they stay manual.
+        """
+
+        if not self.auto_login_enabled or self._auto_login_attempted:
+            return False
+        page = self._require_page()
+        if self._auto_login_skipped_url == page.url:
+            return False
+
+        async with self._auto_login_lock:
+            if self._auto_login_attempted or self._auto_login_skipped_url == page.url:
+                return False
+            credentials = self.settings.lms_credentials
+            if credentials is None:
+                return False
+            if not await self._is_plain_login_form(page):
+                # Remember this page so polling does not re-check it every tick.
+                self._auto_login_skipped_url = page.url
+                self._emit(
+                    "browser",
+                    "Automatic login is enabled, but this sign-in page needs manual "
+                    "action (SSO, MFA, CAPTCHA, or an unknown form).",
+                )
+                return False
+
+            username, password = credentials
+            self._auto_login_attempted = True
+            self._emit("browser", "Attempting automatic Moodle login")
+            try:
+                await page.locator('input[name="username"]').first.fill(username)
+                await page.locator('input[name="password"]').first.fill(password)
+                submit = page.locator(
+                    '#loginbtn, input[type="submit"], button[type="submit"]'
+                ).first
+                await submit.click()
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=min(self.settings.browser_timeout_ms, 30000),
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                logged_in: bool | None = None
+                for _ in range(3):
+                    logged_in = await self._detect_login(page)
+                    if logged_in is True:
+                        break
+                    await page.wait_for_timeout(400)
+            except PlaywrightError:
+                logger.debug("Automatic Moodle login failed", exc_info=True)
+                self._emit(
+                    "warning",
+                    "Automatic Moodle login could not fill the form. Finish logging "
+                    "in manually in the Chrome window.",
+                )
+                return False
+
+            if logged_in is True:
+                self._emit("browser", "Automatic Moodle login succeeded")
+                return True
+            self._emit(
+                "warning",
+                "Automatic Moodle login did not succeed. Check LMS_USERNAME and "
+                "LMS_PASSWORD in .env, or log in manually in the Chrome window.",
+            )
+            return False
+
+    async def _is_plain_login_form(self, page: Page) -> bool:
+        """True only for the standard Moodle username/password form.
+
+        Guards against typing the password into an SSO provider or any other
+        page: the host must be the Moodle host, and the form must carry Moodle's
+        hidden ``logintoken`` plus exactly one empty username and password field.
+        A page with a CAPTCHA is skipped, as is a form a human already started.
+        """
+
+        try:
+            parsed = urlparse(page.url)
+        except ValueError:
+            return False
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+
+        host = parsed.hostname.lower()
+        moodle_host = (self.settings.moodle_host or "").lower()
+        if moodle_host and host != moodle_host and not host.endswith("." + moodle_host):
+            return False
+        if self._policy.base_hosts and not self._policy.permits(page.url):
+            return False
+
+        try:
+            usernames = page.locator('input[name="username"]')
+            passwords = page.locator('input[name="password"]')
+            tokens = page.locator('input[name="logintoken"]')
+            if await usernames.count() != 1 or await passwords.count() != 1:
+                return False
+            if await tokens.count() < 1:
+                return False
+            if await passwords.first.get_attribute("type") != "password":
+                return False
+            # Never fight a human: if either field already has a value (typed,
+            # pasted, or autofilled), leave the form to them.
+            if (await usernames.first.input_value()).strip():
+                return False
+            if await passwords.first.input_value():
+                return False
+            # CAPTCHA means a scripted submit cannot succeed and may look abusive.
+            captcha = page.locator(
+                'input[name*="captcha" i], img[src*="captcha" i], '
+                'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], .g-recaptcha'
+            )
+            return await captcha.count() == 0
+        except PlaywrightError:
+            return False
 
     async def _detect_login(self, page: Page) -> bool | None:
         """Heuristic login detection that works across common Moodle themes.
@@ -400,18 +549,26 @@ class BrowserSession:
         self._policy = self._policy.add_host(url)
 
     async def require_login(self) -> None:
-        """Raise a clear error if the user has not completed manual login."""
+        """Ensure Moodle is logged in, using the opt-in automatic login once."""
+
         if not self.is_running:
             raise BrowserError(
                 "The browser is not connected. Enter your Moodle URL in the dashboard, "
                 "click Connect, and log in manually in the visible Chrome window."
             )
         await self.refresh_status()
-        if self._status.logged_in is not True:
+        if self._status.logged_in is True:
+            return
+        if self.auto_login_enabled and self._auto_login_attempted:
             raise BrowserError(
-                "Moodle is not logged in yet. Please finish logging in manually in the "
-                "Chrome window (including any SSO/MFA step), then ask again."
+                "Automatic Moodle login did not succeed. Check LMS_USERNAME and "
+                "LMS_PASSWORD in .env, or log in manually in the Chrome window "
+                "(including any SSO/MFA step), then ask again."
             )
+        raise BrowserError(
+            "Moodle is not logged in yet. Please finish logging in manually in the "
+            "Chrome window (including any SSO/MFA step), then ask again."
+        )
 
     async def current_page(self) -> dict[str, Any]:
         page = self._require_page()

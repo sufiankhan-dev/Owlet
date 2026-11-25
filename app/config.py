@@ -1,14 +1,16 @@
 """Typed, validated application configuration.
 
 All values come from environment variables (optionally loaded from ``.env``).
-No secret is ever stored here: the Moodle password never enters the process.
+The Moodle account password enters the process only when the owner opts in with
+``LMS_AUTO_LOGIN=true``; it stays in memory, is excluded from ``repr``, and is
+never logged, stored in the database, or sent to the model.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -131,6 +133,11 @@ class Settings:
     moodle_url: str | None
     # Courses hidden everywhere, as (host, Moodle course id) from IGNORED_COURSES.
     ignored_courses: frozenset[tuple[str, str]]
+    # Opt-in automatic Moodle account login (see AGENTS.md §1). Off by default;
+    # when off these values are ignored and login stays manual.
+    lms_auto_login: bool
+    lms_username: str
+    lms_password: str = field(repr=False)
 
     max_download_mb: int
     # Chat image attachments: per-image size cap and how many one message may carry.
@@ -203,6 +210,14 @@ class Settings:
         return (urlparse(self.ollama_host).hostname or "") not in LOOPBACK_HOSTS
 
     @property
+    def lms_credentials(self) -> tuple[str, str] | None:
+        """The opt-in Moodle account pair, or None when login stays manual."""
+
+        if self.lms_auto_login and self.lms_username and self.lms_password:
+            return self.lms_username, self.lms_password
+        return None
+
+    @property
     def moodle_host(self) -> str | None:
         if not self.moodle_url:
             return None
@@ -258,6 +273,20 @@ def load_settings() -> Settings:
         if parsed_moodle.scheme not in {"http", "https"} or not parsed_moodle.hostname:
             raise ValueError(f"MOODLE_URL must be an http(s) URL, got {moodle_url!r}")
 
+    lms_auto_login = _env_bool("LMS_AUTO_LOGIN", False)
+    lms_username = _env_str("LMS_USERNAME", "")
+    # Passwords may contain leading/trailing spaces, so never strip this one.
+    lms_password = os.getenv("LMS_PASSWORD", "") or ""
+    if lms_auto_login and not (lms_username and lms_password):
+        raise ValueError(
+            "LMS_AUTO_LOGIN=true needs both LMS_USERNAME and LMS_PASSWORD in .env. "
+            "Set them, or remove the flag and log in manually in Chrome."
+        )
+    if not lms_auto_login:
+        # Keep the secret out of the process entirely unless it is opted in.
+        lms_username = ""
+        lms_password = ""
+
     profile = Path(_env_str("BROWSER_PROFILE_DIR", "browser/profile"))
     if not profile.is_absolute():
         profile = PROJECT_ROOT / profile
@@ -293,6 +322,9 @@ def load_settings() -> Settings:
         browser_profile_dir=profile,
         moodle_url=moodle_url,
         ignored_courses=_env_course_urls("IGNORED_COURSES"),
+        lms_auto_login=lms_auto_login,
+        lms_username=lms_username,
+        lms_password=lms_password,
         max_download_mb=_env_int("MAX_DOWNLOAD_MB", 50, 1, 500),
         max_image_mb=_env_int("MAX_IMAGE_MB", 8, 1, 20),
         max_images_per_message=_env_int("MAX_IMAGES_PER_MESSAGE", 4, 1, 10),
