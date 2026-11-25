@@ -1997,6 +1997,20 @@ input[type="password"]:focus {
   color: var(--muted-foreground);
 }
 
+.attach-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-color: transparent;
+  color: var(--muted-foreground);
+}
+
+.attach-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--foreground);
+  opacity: 1;
+}
+
 .btn.send {
   height: 28px;
   padding: 0 12px;

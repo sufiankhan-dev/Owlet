@@ -1242,7 +1242,7 @@
     if (els.messageInput) {
       els.messageInput.placeholder = state.running
         ? "The agent is working… press Stop to interrupt"
-        : "Ask Owlet… (attach an image with the paperclip)";
+        : "Ask Owlet…";
     }
     updateComposerState();
   }
