@@ -94,3 +94,53 @@ def test_a_malformed_host_is_still_refused(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="not a valid http"):
         load_settings()
+
+
+def _configure_lms(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    flag: str | None,
+    username: str | None,
+    password: str | None,
+) -> None:
+    """Set the opt-in Moodle login variables; ``None`` removes one."""
+
+    for name, value in (
+        ("LMS_AUTO_LOGIN", flag),
+        ("LMS_USERNAME", username),
+        ("LMS_PASSWORD", password),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def test_automatic_login_is_off_by_default(monkeypatch) -> None:
+    _configure_lms(monkeypatch, flag=None, username="student", password="secret")
+
+    settings = load_settings()
+
+    assert settings.lms_auto_login is False
+    assert settings.lms_credentials is None
+    # The secret must not even be retained when the flag is off.
+    assert settings.lms_username == ""
+    assert settings.lms_password == ""
+
+
+def test_automatic_login_needs_both_credentials(monkeypatch) -> None:
+    _configure_lms(monkeypatch, flag="true", username="student", password=None)
+
+    with pytest.raises(ValueError, match="LMS_USERNAME and LMS_PASSWORD"):
+        load_settings()
+
+
+def test_automatic_login_keeps_the_password_out_of_repr(monkeypatch) -> None:
+    _configure_lms(monkeypatch, flag="true", username="student", password=" p@ss word ")
+
+    settings = load_settings()
+
+    # Surrounding spaces are part of a password and must survive.
+    assert settings.lms_credentials == ("student", " p@ss word ")
+    assert "p@ss word" not in repr(settings)
+

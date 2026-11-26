@@ -1242,7 +1242,7 @@
     if (els.messageInput) {
       els.messageInput.placeholder = state.running
         ? "The agent is working… press Stop to interrupt"
-        : "Ask Owlet… (attach an image with the paperclip)";
+        : "Ask Owlet…";
     }
     updateComposerState();
   }
@@ -1591,13 +1591,6 @@
     changed: ["Changed since review", "chip chip-warn"],
     reviewed: ["Reviewed", "chip chip-ok"],
   };
-
-  function formatBytes(size) {
-    const value = Number(size) || 0;
-    if (value < 1024) return `${value} B`;
-    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-  }
 
   function draftFileItem(file, extraClass) {
     const item = document.createElement("li");
@@ -2704,7 +2697,9 @@
     els.sendBtn.disabled = state.running || !hasContent;
   }
 
-  function hasFiles(event) {
+  // Named distinctly from the file-tree helper above: a second `hasFiles`
+  // declaration in this scope would hoist over it and blank the Files card.
+  function dragHasFiles(event) {
     const types = event.dataTransfer?.types;
     return Boolean(types && Array.from(types).includes("Files"));
   }
@@ -2725,14 +2720,14 @@
     if (!panel) return;
 
     panel.addEventListener("dragenter", (event) => {
-      if (!hasFiles(event)) return;
+      if (!dragHasFiles(event)) return;
       event.preventDefault();
       dragDepth += 1;
       showDrop(true);
     });
 
     panel.addEventListener("dragover", (event) => {
-      if (!hasFiles(event)) return;
+      if (!dragHasFiles(event)) return;
       event.preventDefault();
       if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
       showDrop(true);
