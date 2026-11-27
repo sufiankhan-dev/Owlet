@@ -422,12 +422,6 @@ Issues and pull requests are welcome. Before you start, read
 rules intact: **no cloud AI, read-only Moodle, no passwords by default, nothing
 runs automatically.**
 
-## Disclaimer
-
-Owlet is not affiliated with Moodle. You are responsible for following your
-institution's academic-integrity rules and Moodle terms of use. Owlet never
-submits work on your behalf.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
